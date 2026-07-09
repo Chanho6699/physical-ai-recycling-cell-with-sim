@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Logs and results
+results/logs/*.jsonl
+results/videos/
+results/latency/
+results/onnx_eval/
+results/isaacsim/
+
+# Large model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.weights
+
+# Dataset
+datasets/
+data/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Isaac Sim / Omniverse
+.cache/
+ov/
+kit/
