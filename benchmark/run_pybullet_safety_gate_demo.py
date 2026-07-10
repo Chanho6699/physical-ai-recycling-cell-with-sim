@@ -52,6 +52,12 @@ def run_demo(simulate_hazard: bool, monitor: str = "mock") -> None:
             safety_monitor = YOLOSafetyMonitor()
             if simulate_hazard:
                 print("--simulate-hazard is ignored with --monitor yolo (mock-only option).")
+        elif monitor == "onnx":
+            from safety.onnx_yolo_safety_monitor import ONNXRuntimeYOLOSafetyMonitor
+
+            safety_monitor = ONNXRuntimeYOLOSafetyMonitor()
+            if simulate_hazard:
+                print("--simulate-hazard is ignored with --monitor onnx (mock-only option).")
         else:
             safety_monitor = MockSafetyMonitor(simulate_hazard=simulate_hazard)
 
@@ -113,7 +119,7 @@ def run_demo(simulate_hazard: bool, monitor: str = "mock") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulate-hazard", action="store_true")
-    parser.add_argument("--monitor", choices=["mock", "yolo"], default="mock")
+    parser.add_argument("--monitor", choices=["mock", "yolo", "onnx"], default="mock")
     args = parser.parse_args()
 
     run_demo(simulate_hazard=args.simulate_hazard, monitor=args.monitor)
