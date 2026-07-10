@@ -46,6 +46,7 @@ class PyBulletBackend(SimulatorBackend):
         self._ee_position = [0.0, 0.0, 0.5]
         self._ee_orientation = [0.0, 0.0, 0.0]  # roll, pitch, yaw
         self._gripper_state = "open"
+        self._object_type = "unknown"
 
     @property
     def client_id(self):
@@ -100,6 +101,7 @@ class PyBulletBackend(SimulatorBackend):
         self._held_object_id = None
         self._task_status = "running"
         self._last_event = "none"
+        self._object_type = "unknown"
 
         for _ in range(SIMULATION_STEPS_PER_COMMAND):
             p.stepSimulation(physicsClientId=self._client_id)
@@ -174,12 +176,30 @@ class PyBulletBackend(SimulatorBackend):
 
         return self.get_state()
 
+    def set_object_position(self, position: list) -> dict:
+        # v0: assumes the object is not currently held. If it were, this
+        # would fight with the grasp-follow logic in apply_command(); not
+        # handled here since the Real2Sim demo only calls this right after
+        # reset(), before any grasp happens.
+        self._object_position = list(position)
+        p.resetBasePositionAndOrientation(
+            self._object_id,
+            self._object_position,
+            [0, 0, 0, 1],
+            physicsClientId=self._client_id,
+        )
+        return self.get_state()
+
+    def set_object_type(self, object_type: str) -> None:
+        self._object_type = object_type
+
     def get_state(self) -> dict:
         return {
             "simulator": "pybullet",
             "end_effector_position": list(self._ee_position),
             "gripper_state": self._gripper_state,
             "object_position": list(self._object_position),
+            "object_type": self._object_type,
             "bin_position": list(self._bin_position),
             "held_object": self._held_object_id is not None,
             "task_status": self._task_status,

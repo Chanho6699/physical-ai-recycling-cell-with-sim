@@ -34,7 +34,14 @@ weights/*.engine
 
 # Dataset
 datasets/
-data/
+data/*
+!data/test_images/
+
+# Local test images (folder structure kept, actual images are not)
+data/test_images/*.jpg
+data/test_images/*.jpeg
+data/test_images/*.png
+!data/test_images/.gitkeep
 
 # OS / IDE
 .DS_Store
