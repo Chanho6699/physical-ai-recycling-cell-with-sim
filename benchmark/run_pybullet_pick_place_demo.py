@@ -12,10 +12,12 @@ from datetime import datetime
 from pathlib import Path
 
 from action_adapter.adapter_v0 import RobotCommand
+from robot_sim.camera_utils import capture_pybullet_camera, save_rgb_image
 from robot_sim.pybullet_backend import PyBulletBackend
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_PATH = PROJECT_ROOT / "results" / "logs" / "pybullet_pick_place_demo_log.jsonl"
+FINAL_CAMERA_PATH = PROJECT_ROOT / "results" / "camera" / "pybullet_pick_place_final.png"
 
 GUI_MODE = True
 KEEP_GUI_OPEN = True
@@ -107,6 +109,10 @@ def run_demo() -> None:
         final_status = state_before["task_status"]
         print(f"\n=== Demo finished: task_status={final_status} ===")
         print("PASS" if final_status == "success" else "FAIL")
+
+        final_image = capture_pybullet_camera(physics_client_id=backend.client_id)
+        saved_path = save_rgb_image(final_image, str(FINAL_CAMERA_PATH))
+        print(f"Saved final camera image to: {saved_path}")
 
         if KEEP_GUI_OPEN:
             print(f"Keeping PyBullet GUI open (up to {KEEP_SECONDS}s if no input)...")

@@ -47,6 +47,10 @@ class PyBulletBackend(SimulatorBackend):
         self._ee_orientation = [0.0, 0.0, 0.0]  # roll, pitch, yaw
         self._gripper_state = "open"
 
+    @property
+    def client_id(self):
+        return self._client_id
+
     def reset(self) -> dict:
         if self._client_id is not None:
             p.disconnect(self._client_id)
