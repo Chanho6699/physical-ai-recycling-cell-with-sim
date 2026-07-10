@@ -31,7 +31,7 @@ KEEP_SECONDS = 30
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["sim", "webcam"], default="sim")
-    parser.add_argument("--model-path", type=str, default="yolo26n.pt")
+    parser.add_argument("--model-path", type=str, default="weights/yolo26n.pt")
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
     parser.add_argument("--hazard-labels", type=str, default="person")
     parser.add_argument("--camera-index", type=int, default=0)

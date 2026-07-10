@@ -26,6 +26,12 @@ results/isaacsim/
 *.trt
 *.weights
 
+# Model weights and exported models
+weights/*.pt
+weights/*.pth
+weights/*.onnx
+weights/*.engine
+
 # Dataset
 datasets/
 data/

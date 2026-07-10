@@ -21,7 +21,7 @@ DEFAULT_HAZARD_LABELS = {"person"}
 class YOLOSafetyMonitor(SafetyMonitor):
     def __init__(
         self,
-        model_path: str = "yolo26n.pt",
+        model_path: str = "weights/yolo26n.pt",
         hazard_labels: Optional[set] = None,
         confidence_threshold: float = 0.5,
     ):
