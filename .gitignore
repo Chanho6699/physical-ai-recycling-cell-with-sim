@@ -45,3 +45,9 @@ results/logs/*.jsonl
 results/camera/*.png
 results/camera/*.jpg
 results/camera/*.jpeg
+
+# Generated outputs
+results/logs/*.jsonl
+results/camera/*.png
+results/camera/*.jpg
+results/camera/*.jpeg

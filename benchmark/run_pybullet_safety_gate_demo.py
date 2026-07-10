@@ -36,7 +36,7 @@ def append_log(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def run_demo(simulate_hazard: bool) -> None:
+def run_demo(simulate_hazard: bool, monitor: str = "mock") -> None:
     backend = PyBulletBackend(gui=GUI_MODE)
     frame_source = None
     try:
@@ -45,7 +45,15 @@ def run_demo(simulate_hazard: bool) -> None:
         print(state)
 
         frame_source = SimCameraSource(physics_client_id=backend.client_id)
-        safety_monitor = MockSafetyMonitor(simulate_hazard=simulate_hazard)
+
+        if monitor == "yolo":
+            from safety.yolo_safety_monitor import YOLOSafetyMonitor
+
+            safety_monitor = YOLOSafetyMonitor()
+            if simulate_hazard:
+                print("--simulate-hazard is ignored with --monitor yolo (mock-only option).")
+        else:
+            safety_monitor = MockSafetyMonitor(simulate_hazard=simulate_hazard)
 
         state_before = state
         for step_index, (description, robot_command) in enumerate(STEP_SEQUENCE, start=1):
@@ -105,6 +113,7 @@ def run_demo(simulate_hazard: bool) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulate-hazard", action="store_true")
+    parser.add_argument("--monitor", choices=["mock", "yolo"], default="mock")
     args = parser.parse_args()
 
-    run_demo(simulate_hazard=args.simulate_hazard)
+    run_demo(simulate_hazard=args.simulate_hazard, monitor=args.monitor)
