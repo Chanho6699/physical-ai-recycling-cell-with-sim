@@ -23,7 +23,14 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-GRIPPER_ACTION_THRESHOLD = 1e-4
+# Real Panda finger open/close swings ~0.038m (0.08 <-> ~0.04, minus
+# object width). Once the gripper is holding something, PyBullet's
+# position-controlled fingers settle with noise up to ~1e-3m step to
+# step (measured empirically) -- a threshold of 1e-4 misreads that noise
+# as spurious "open"/"close" events, which breaks replay (the object
+# gets released mid-carry). 0.005 sits comfortably between the noise
+# ceiling and a real transition.
+GRIPPER_ACTION_THRESHOLD = 0.005
 
 OBSERVATION_KEYS = [
     "image_path",
@@ -94,6 +101,7 @@ class LeRobotDatasetExporter:
             instruction = episode.get("instruction", "")
             task_goal = episode.get("task_goal") or {}
             final_state = episode.get("final_state") or {}
+            raw_metadata = episode.get("metadata") or {}
             steps = sorted(episode.get("steps", []), key=lambda s: s.get("step_index", 0))
 
             episode_frames_dir = frames_root / episode_id
@@ -173,6 +181,13 @@ class LeRobotDatasetExporter:
                     "num_raw_steps": len(steps),
                     "num_samples": num_samples_this_episode,
                     "instruction": instruction,
+                    # Carried through from the raw episode so a replay
+                    # script can re-initialize the sim (object_type,
+                    # mapped_sim_position, bin_position) without needing
+                    # to re-run detection/Real2Sim mapping. Purely
+                    # additive -- existing consumers that only read the
+                    # other keys are unaffected.
+                    "metadata": raw_metadata,
                 }
             )
 
