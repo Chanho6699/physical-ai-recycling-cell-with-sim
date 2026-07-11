@@ -44,6 +44,19 @@ DEFAULT_MOVE_STEPS = 120
 DEFAULT_GRIPPER_STEPS = 60
 
 
+def _evaluate_safety_result(result):
+    """Accepts either a SafetyGateResult or a SafetyDecision (duck-typed,
+    so this module doesn't need to import the safety package) and returns
+    (should_interrupt, reason)."""
+    if result is None:
+        return False, None
+    if hasattr(result, "allowed"):
+        return (not result.allowed), getattr(result, "reason", None)
+    if hasattr(result, "emergency_stop"):
+        return result.emergency_stop, getattr(result, "reason", None)
+    return False, None
+
+
 class PyBulletPandaBackend(SimulatorBackend):
     def __init__(self, gui: bool = True, time_step: float = 1.0 / 240.0):
         self.gui = gui
@@ -72,6 +85,8 @@ class PyBulletPandaBackend(SimulatorBackend):
         self.grasp_constraint_id = None
         self._task_status = "running"
         self._last_event = "none"
+        self.last_safety_reason = None
+        self.last_blocked_action = None
 
     def reset(self) -> dict:
         if self.client_id is not None:
@@ -132,6 +147,8 @@ class PyBulletPandaBackend(SimulatorBackend):
         self.grasp_constraint_id = None
         self._task_status = "running"
         self._last_event = "none"
+        self.last_safety_reason = None
+        self.last_blocked_action = None
 
         return self.get_state()
 
@@ -159,6 +176,9 @@ class PyBulletPandaBackend(SimulatorBackend):
         target_position: list,
         target_orientation: list = None,
         steps: int = DEFAULT_MOVE_STEPS,
+        safety_callback=None,
+        action_name: str = "move_end_effector_to",
+        safety_check_interval: int = 10,
     ) -> dict:
         if target_orientation is None:
             target_orientation = self.default_orientation
@@ -183,10 +203,41 @@ class PyBulletPandaBackend(SimulatorBackend):
             physicsClientId=self.client_id,
         )
 
-        for _ in range(steps):
+        for step_index in range(steps):
             p.stepSimulation(physicsClientId=self.client_id)
 
+            if (
+                safety_callback is not None
+                and safety_check_interval > 0
+                and (step_index + 1) % safety_check_interval == 0
+            ):
+                result = safety_callback(action_name)
+                should_interrupt, reason = _evaluate_safety_result(result)
+                if should_interrupt:
+                    self._interrupt_motion(action_name, reason)
+                    break
+
         return self.get_state()
+
+    def _interrupt_motion(self, action_name: str, reason) -> None:
+        current_joint_states = p.getJointStates(
+            self.robot_id, self.arm_joint_indices, physicsClientId=self.client_id
+        )
+        current_positions = [s[0] for s in current_joint_states]
+
+        p.setJointMotorControlArray(
+            self.robot_id,
+            self.arm_joint_indices,
+            p.POSITION_CONTROL,
+            targetPositions=current_positions,
+            forces=ARM_JOINT_FORCES,
+            physicsClientId=self.client_id,
+        )
+
+        self._task_status = "interrupted_by_safety"
+        self._last_event = f"safety_interrupted:{action_name}"
+        self.last_safety_reason = reason
+        self.last_blocked_action = action_name
 
     def open_gripper(self, steps: int = DEFAULT_GRIPPER_STEPS) -> dict:
         p.setJointMotorControlArray(
@@ -318,6 +369,8 @@ class PyBulletPandaBackend(SimulatorBackend):
             "held_object": self._held_object,
             "task_status": self._task_status,
             "last_event": self._last_event,
+            "safety_reason": self.last_safety_reason,
+            "blocked_action": self.last_blocked_action,
         }
 
     def close(self) -> None:
