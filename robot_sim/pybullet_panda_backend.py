@@ -179,6 +179,8 @@ class PyBulletPandaBackend(SimulatorBackend):
         safety_callback=None,
         action_name: str = "move_end_effector_to",
         safety_check_interval: int = 10,
+        trajectory_callback=None,
+        trajectory_record_interval: int = 10,
     ) -> dict:
         if target_orientation is None:
             target_orientation = self.default_orientation
@@ -205,6 +207,17 @@ class PyBulletPandaBackend(SimulatorBackend):
 
         for step_index in range(steps):
             p.stepSimulation(physicsClientId=self.client_id)
+
+            if (
+                trajectory_callback is not None
+                and trajectory_record_interval > 0
+                and step_index % trajectory_record_interval == 0
+            ):
+                trajectory_callback(
+                    action_name=action_name,
+                    step_index=step_index,
+                    robot_state=self.get_state(),
+                )
 
             if (
                 safety_callback is not None

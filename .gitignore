@@ -33,7 +33,8 @@ weights/*.onnx
 weights/*.engine
 
 # Dataset
-datasets/
+datasets/*
+!datasets/.gitkeep
 data/*
 !data/test_images/
 
