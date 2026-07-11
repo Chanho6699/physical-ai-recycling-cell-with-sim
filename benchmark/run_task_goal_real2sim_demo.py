@@ -1,18 +1,15 @@
-"""Image-file-based Real2Sim demo (v0).
+"""Natural-language TaskGoal + Image-based Real2Sim target selection demo (v0).
 
-  image file
-  -> ONNXYOLODetector
-  -> recyclable object detection (bottle/cup)
-  -> bbox center
-  -> ImageToSimMapper (image coords -> approximate PyBullet table coords)
-  -> PyBulletBackend.set_object_position()
-  -> run_dynamic_pick_place() (robot_sim.pick_place_policy) -- builds each
-     command from the *current* state, NOT the fixed STEP_SEQUENCE from
-     run_pybullet_pick_place_demo.py, which assumes the object always
-     spawns at [0.5, 0.0, 0.53] and would miss the grasp otherwise
+  instruction (Korean)
+  -> RuleBasedTaskGoalParser -> TaskGoal
+  -> image file -> ONNXYOLODetector -> detections
+  -> RecyclableObjectMapper.select_recyclable_by_target(detections, TaskGoal.target_object)
+  -> bbox center -> ImageToSimMapper -> PyBullet position
+  -> PyBulletBackend.set_object_type()/set_object_position()
+  -> run_dynamic_pick_place() (robot_sim.pick_place_policy)
 
-No real webcam, no precise Real2Sim calibration, no OpenVLA, no ROS 2,
-no TensorRT, no YOLO training, no latency benchmark here yet.
+No real LLM API, no VLA action generation, no Panda URDF backend, no
+ROS 2, no TensorRT, no Isaac Sim, no latency benchmark here yet.
 """
 
 import argparse
@@ -22,6 +19,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
+from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.detection_types import Detection
 from perception.onnx_yolo_detector import ONNXYOLODetector
 from real2sim.image_to_sim_mapper import ImageToSimMapper
@@ -31,7 +29,9 @@ from robot_sim.pick_place_policy import run_dynamic_pick_place
 from robot_sim.pybullet_backend import PyBulletBackend
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEBUG_IMAGE_PATH = PROJECT_ROOT / "results" / "camera" / "image_real2sim_debug.png"
+DEBUG_IMAGE_PATH = PROJECT_ROOT / "results" / "camera" / "task_goal_real2sim_debug.png"
+
+DEFAULT_INSTRUCTION = "플라스틱 병을 플라스틱 수거함에 넣어줘"
 
 KEEP_GUI_OPEN = True
 KEEP_SECONDS = 30
@@ -39,6 +39,7 @@ KEEP_SECONDS = 30
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
     parser.add_argument("--image-path", type=str, required=True)
     parser.add_argument("--model-path", type=str, default="weights/yolo26n.onnx")
     parser.add_argument("--confidence-threshold", type=float, default=0.25)
@@ -52,7 +53,7 @@ def resolve(path_str: str) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def draw_debug_image(frame: np.ndarray, detection: Detection, sim_position: list) -> np.ndarray:
+def draw_debug_image(frame: np.ndarray, detection: Detection, sim_position: list, task_goal) -> np.ndarray:
     image = Image.fromarray(frame)
     draw = ImageDraw.Draw(image)
 
@@ -67,8 +68,11 @@ def draw_debug_image(frame: np.ndarray, detection: Detection, sim_position: list
     )
 
     label_text = f"{detection.label} {detection.confidence:.2f}"
+    goal_text = f"goal: {task_goal.target_object} -> {task_goal.target_bin}"
     sim_text = f"sim_pos=({sim_position[0]:.2f}, {sim_position[1]:.2f}, {sim_position[2]:.2f})"
-    draw.text((x1, max(y1 - 24, 0)), label_text, fill=(255, 0, 0))
+
+    draw.text((x1, max(y1 - 40, 0)), goal_text, fill=(255, 0, 0))
+    draw.text((x1, max(y1 - 22, 0)), label_text, fill=(255, 0, 0))
     draw.text((x1, min(y2 + 4, image.height - 12)), sim_text, fill=(255, 0, 0))
 
     return np.array(image)
@@ -76,6 +80,17 @@ def draw_debug_image(frame: np.ndarray, detection: Detection, sim_position: list
 
 def main() -> None:
     args = parse_args()
+
+    task_goal_parser = RuleBasedTaskGoalParser()
+    task_goal = task_goal_parser.parse(args.instruction)
+    if task_goal is None:
+        print(f"Could not parse instruction: {args.instruction!r}")
+        print("Supported objects: plastic bottle (플라스틱 병/페트병/병), plastic cup (컵/플라스틱 컵).")
+        print("Supported bins: plastic bin (플라스틱 수거함/플라스틱 통).")
+        return
+
+    print("=== TaskGoal ===")
+    print(task_goal)
 
     image_path = Path(args.image_path)
     if not image_path.exists():
@@ -102,14 +117,15 @@ def main() -> None:
         return
 
     recyclable_mapper = RecyclableObjectMapper()
-    best = recyclable_mapper.select_best_recyclable(detections)
+    best = recyclable_mapper.select_recyclable_by_target(detections, task_goal.target_object)
     if best is None:
-        print("No bottle/cup candidates found among the detections.")
+        print(f"No detection matching TaskGoal.target_object={task_goal.target_object!r} was found.")
+        print("Try a different image, a lower --confidence-threshold, or a different --instruction.")
         return
 
     detection, sim_object_type = best
     print(
-        f"Selected recyclable candidate: {detection.label} "
+        f"Selected candidate matching TaskGoal: {detection.label} "
         f"(confidence={detection.confidence:.2f}) -> {sim_object_type}"
     )
 
@@ -131,7 +147,7 @@ def main() -> None:
         print(state)
 
         if args.save_debug_image:
-            debug_image = draw_debug_image(frame, detection, sim_position)
+            debug_image = draw_debug_image(frame, detection, sim_position, task_goal)
             saved_path = save_rgb_image(debug_image, str(DEBUG_IMAGE_PATH))
             print(f"Saved debug image to: {saved_path}")
 

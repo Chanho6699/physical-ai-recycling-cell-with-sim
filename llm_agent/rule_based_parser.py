@@ -2,6 +2,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import List, Optional, TypedDict
 
+from llm_agent.task_goal import TaskGoal as NLTaskGoal
+
 
 @dataclass
 class TaskGoal:
@@ -73,6 +75,54 @@ class RuleBasedTaskParser:
         return None
 
 
+# Separate object/bin tables for the Real2Sim natural-language demo. Kept
+# apart from OBJECT_TABLE/BIN_TABLE above because the target ids here
+# (plastic_bottle/plastic_cup) describe Real2Sim sim_object_type values,
+# not the VLA-instruction-oriented ids used by RuleBasedTaskParser.
+NL_OBJECT_TABLE: List[dict] = [
+    {"keywords": ["플라스틱 병", "페트병", "병"], "id": "plastic_bottle"},
+    {"keywords": ["플라스틱 컵", "컵"], "id": "plastic_cup"},
+]
+
+NL_BIN_TABLE: List[dict] = [
+    {"keywords": ["플라스틱 수거함", "플라스틱 통"], "id": "plastic_bin"},
+]
+
+
+class RuleBasedTaskGoalParser:
+    """Rule-based Korean command -> (new-style) TaskGoal parser.
+
+    Separate from RuleBasedTaskParser above -- this one targets the
+    Real2Sim natural-language demo's TaskGoal shape (llm_agent.task_goal).
+    No LLM involved yet; kept simple so it can later be swapped for an
+    LLM-based parser behind the same `parse(instruction) -> TaskGoal | None`
+    interface. Returns None (rather than raising) for unsupported commands
+    so callers can print a friendly message instead of a traceback.
+    """
+
+    def parse(self, instruction: str) -> Optional[NLTaskGoal]:
+        object_id = self._match_id(instruction, NL_OBJECT_TABLE)
+        bin_id = self._match_id(instruction, NL_BIN_TABLE)
+
+        if object_id is None or bin_id is None:
+            return None
+
+        return NLTaskGoal(
+            action="pick_and_place",
+            target_object=object_id,
+            target_bin=bin_id,
+            instruction=instruction,
+        )
+
+    @staticmethod
+    def _match_id(command: str, table: List[dict]) -> Optional[str]:
+        for entry in table:
+            for keyword in entry["keywords"]:
+                if keyword in command:
+                    return entry["id"]
+        return None
+
+
 if __name__ == "__main__":
     parser = RuleBasedTaskParser()
 
@@ -86,3 +136,17 @@ if __name__ == "__main__":
         goal = parser.parse(command)
         print(json.dumps(asdict(goal), ensure_ascii=False, indent=2))
         print()
+
+    nl_parser = RuleBasedTaskGoalParser()
+    nl_sample_commands = [
+        "플라스틱 병을 플라스틱 수거함에 넣어줘",
+        "페트병을 플라스틱 수거함에 넣어줘",
+        "병을 플라스틱 수거함에 넣어줘",
+        "컵을 플라스틱 수거함에 넣어줘",
+        "플라스틱 컵을 플라스틱 수거함에 넣어줘",
+        "유리병을 유리 수거함에 넣어줘",  # unsupported -> None
+    ]
+
+    for command in nl_sample_commands:
+        nl_goal = nl_parser.parse(command)
+        print(command, "->", nl_goal)
