@@ -152,7 +152,7 @@ class PyBulletPandaBackend(SimulatorBackend):
 
         return self.get_state()
 
-    def apply_command(self, command: RobotCommand) -> dict:
+    def apply_command(self, command: RobotCommand, steps: int = DEFAULT_MOVE_STEPS) -> dict:
         ee_position, ee_orientation = self._get_ee_pose()
 
         target_position = [
@@ -162,7 +162,7 @@ class PyBulletPandaBackend(SimulatorBackend):
         ]
         # v1: orientation deltas (target_droll/dpitch/dyaw) are ignored --
         # keep the current end-effector orientation as-is.
-        self.move_end_effector_to(target_position, ee_orientation)
+        self.move_end_effector_to(target_position, ee_orientation, steps=steps)
 
         if command.gripper_command == "open":
             self.open_gripper()
