@@ -88,7 +88,7 @@ frame → SafetyMonitor.check(frame) → SafetyDecision(emergency_stop, reason, 
 
 ### TrajectoryRecorder / Dataset Export / Replay Validation
 
-자세한 내용은 [dataset_pipeline.md](dataset_pipeline.md)를 참고하세요.
+`--record`를 켜면 로봇 trajectory뿐 아니라 external camera 관찰 → YOLO detection → Real2Sim(ROI/ArUco) mapping → wrist camera refinement → robot 실행 → 최종 결과로 이어지는 전체 perception-to-action 체인이 episode마다 `metadata.json`으로 함께 저장되고, `benchmark/inspect_recorded_episode.py`로 요약을 확인할 수 있습니다. 자세한 스키마와 파일 구조는 [dataset_pipeline.md](dataset_pipeline.md)를 참고하세요.
 
 ## 다음 단계: FastAPI dummy OpenVLA server 연결
 

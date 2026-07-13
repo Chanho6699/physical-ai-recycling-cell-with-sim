@@ -251,3 +251,38 @@ python -m benchmark.run_full_recycling_cell_demo \
 ```
 
 기대 결과: `=== Wrist Camera Grasp Refinement ===` 출력, `refinement_applied: True`(신뢰 조건을 만족할 때), `final_status: success`, **PASS**. 최종 요약에도 `wrist_refinement_applied`/`wrist_refinement_delta_xy`가 함께 출력됩니다. 신뢰 조건(안 보임/픽셀 부족/보정폭 초과)을 만족하지 못하면 원래 coarse target 그대로 pick-and-place를 진행합니다(fallback).
+
+## 17. Full demo + episode recording (perception-to-action 전체 기록)
+
+`--record`에 `--record-images`를 더하면, 로봇 trajectory뿐 아니라 detection/Real2Sim mapping/wrist camera refinement 정보까지 episode 폴더 하나에 함께 저장됩니다(`metadata.json` + `debug/*.json` + `frames/*`).
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --confidence-threshold 0.10 \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --save-wrist-camera-images \
+  --save-webcam-frame \
+  --save-debug-image \
+  --record \
+  --record-images \
+  --gui \
+  --policy-step-delay 0.08
+```
+
+기대 결과: 기존과 동일하게 `final_status: success`, `PASS`이면서 `recorded_episode: datasets/raw_episodes/episode_...`가 함께 출력됩니다. `--no-record-perception-metadata`로 metadata.json 저장만 끌 수 있고(로봇 trajectory 기록 자체는 `--record`만으로 계속 동작), `--episode-tag`로 임의의 태그 문자열을 metadata에 남길 수 있습니다.
+
+## 18. 저장된 episode 요약 확인
+
+```bash
+python -m benchmark.inspect_recorded_episode \
+  --episode-dir datasets/raw_episodes/episode_YYYYMMDD_HHMMSS_xxxxxx
+```
+
+기대 결과: instruction, real2sim mode/mapped position, wrist refinement 적용 여부와 몇 번째 step에서 일어났는지, policy_steps, final_status를 요약 출력하고 성공 episode면 `PASS`.

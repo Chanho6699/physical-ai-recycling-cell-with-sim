@@ -26,7 +26,9 @@ FastAPI OpenVLA server here yet.
 """
 
 import argparse
+import json
 import math
+import shutil
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -37,7 +39,18 @@ from PIL import Image
 
 from action_adapter.adapter_v0 import ActionAdapter
 from benchmark.run_task_goal_real2sim_panda_interrupt_demo import draw_debug_image
-from data_collection.trajectory_recorder import TrajectoryRecorder
+from data_collection.perception_episode_schema import (
+    build_detections_section,
+    build_episode_metadata,
+    build_input_source_section,
+    build_real2sim_section,
+    build_result_section,
+    build_robot_section,
+    build_selected_target_section,
+    build_wrist_camera_section,
+    write_episode_metadata_file,
+)
+from data_collection.trajectory_recorder import TrajectoryRecorder, to_jsonable
 from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.onnx_yolo_detector import ONNXYOLODetector
 from policy.dummy_openvla_policy import DummyOpenVLAPolicy
@@ -129,6 +142,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--record-images", action="store_true")
     parser.add_argument("--output-dir", type=str, default="datasets/raw_episodes")
+
+    perception_metadata_group = parser.add_mutually_exclusive_group()
+    perception_metadata_group.add_argument(
+        "--record-perception-metadata", dest="record_perception_metadata", action="store_true"
+    )
+    perception_metadata_group.add_argument(
+        "--no-record-perception-metadata", dest="record_perception_metadata", action="store_false"
+    )
+    parser.set_defaults(record_perception_metadata=True)
+    parser.add_argument("--episode-tag", type=str, default=None)
 
     gui_group = parser.add_mutually_exclusive_group()
     gui_group.add_argument("--gui", dest="gui", action="store_true")
@@ -262,6 +285,52 @@ def observe_wrist_camera(args, backend, sim_position: list) -> None:
         print(f"Saved wrist camera outputs: {saved_paths}")
 
 
+def copy_perception_artifacts_into_episode(
+    episode_dir: Path,
+    saved_webcam_frame_path,
+    saved_debug_path,
+    mapping_debug: dict,
+    wrist_refinement_debug,
+) -> None:
+    """Best-effort copy/write of already-saved perception artifacts into
+    the episode folder (see docs/dataset_pipeline.md), so an episode
+    carries its own external-camera frame/debug image and Real2Sim/wrist
+    refinement debug JSON without needing results/webcam or
+    results/wrist_camera to still exist later. Never raises -- a missing
+    source path (e.g. --save-webcam-frame wasn't used) just means that
+    particular artifact is skipped.
+    """
+    frames_dir = episode_dir / "frames"
+    debug_dir = episode_dir / "debug"
+
+    if saved_webcam_frame_path:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(saved_webcam_frame_path, frames_dir / "external_webcam_frame.jpg")
+        except OSError as exc:
+            print(f"Could not copy webcam frame into episode folder: {exc}")
+
+    if saved_debug_path:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(saved_debug_path, frames_dir / "external_detection_debug.jpg")
+        except OSError as exc:
+            print(f"Could not copy debug detection image into episode folder: {exc}")
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    mapping_debug_name = (
+        "aruco_mapping_debug.json"
+        if str(mapping_debug.get("mapping_mode", "")).startswith("aruco")
+        else "real2sim_mapping_debug.json"
+    )
+    with open(debug_dir / mapping_debug_name, "w", encoding="utf-8") as debug_file:
+        json.dump(to_jsonable(mapping_debug), debug_file, ensure_ascii=False, indent=2)
+
+    if wrist_refinement_debug is not None:
+        with open(debug_dir / "wrist_refinement_debug.json", "w", encoding="utf-8") as debug_file:
+            json.dump(to_jsonable(wrist_refinement_debug), debug_file, ensure_ascii=False, indent=2)
+
+
 def blocked_state(state: dict, action_name: str, reason: str) -> dict:
     final_state = dict(state)
     final_state["task_status"] = "blocked_by_safety"
@@ -362,6 +431,7 @@ def run_dummy_openvla_policy(
         "wrist_refinement_attempted": False,
         "wrist_refinement_applied": False,
         "wrist_refinement_delta_xy": None,
+        "wrist_refinement_debug": None,
     }
 
     def with_wrist_refinement_info(state_dict: dict) -> dict:
@@ -369,6 +439,7 @@ def run_dummy_openvla_policy(
 
     for step_index in range(args.max_policy_steps):
         robot_state = backend.get_state()
+        refinement_event = None
 
         # Refine the grasp target exactly once, right as the arm is
         # closing in on the object (not before -- an early wrist-camera
@@ -399,6 +470,27 @@ def run_dummy_openvla_policy(
             target_object_position = refined_position
             wrist_refinement_state["wrist_refinement_applied"] = refinement_debug["refinement_applied"]
             wrist_refinement_state["wrist_refinement_delta_xy"] = refinement_debug["xy_delta_from_coarse"]
+            wrist_refinement_state["wrist_refinement_debug"] = refinement_debug
+            refinement_event = {
+                "event_type": "wrist_refinement",
+                "coarse_target_position": refinement_debug["coarse_target_position"],
+                "wrist_estimated_position": refinement_debug["wrist_estimated_position"],
+                "refined_target_position": refinement_debug["refined_target_position"],
+                "refinement_applied": refinement_debug["refinement_applied"],
+            }
+
+            if args.save_wrist_camera_images:
+                refine_frame, refine_render_debug = wrist_camera.render()
+                saved_wrist_paths = save_wrist_camera_outputs(
+                    refine_frame,
+                    {**refine_render_debug, **refinement_debug},
+                    resolve(WRIST_CAMERA_OUTPUT_DIR),
+                    save_depth_colormap=wrist_camera.save_depth_colormap,
+                    save_segmentation_mask=wrist_camera.save_segmentation_mask,
+                    extra_debug={"event": "wrist_refinement", "step_index": step_index},
+                )
+                print(f"Saved wrist camera outputs: {saved_wrist_paths}")
+                refinement_event["saved_wrist_camera_paths"] = saved_wrist_paths
 
         policy_input = PolicyInput(
             image=task_frame,
@@ -430,6 +522,7 @@ def run_dummy_openvla_policy(
                         robot_state=final_state,
                         safety=safety_record,
                         image=task_frame if args.record_images else None,
+                        extra=refinement_event,
                     )
                 return with_wrist_refinement_info(final_state), step_index + 1
 
@@ -453,6 +546,7 @@ def run_dummy_openvla_policy(
                 action={"type": "openvla_style", "vector": policy_output.action, "info": policy_output.info},
                 safety=safety_record,
                 image=task_frame if args.record_images else None,
+                extra=refinement_event,
             )
 
         if policy_step_delay > 0:
@@ -495,6 +589,9 @@ def main() -> None:
         print("Run tools/export_yolo_to_onnx.py first to create it.")
         return
 
+    saved_webcam_frame_path = None
+    saved_debug_path = None
+
     if args.image_source == "image":
         if not args.image_path:
             print("--image-path is required when --image-source image")
@@ -516,8 +613,8 @@ def main() -> None:
         if args.save_webcam_frame:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = resolve(args.webcam_output_dir) / f"webcam_frame_{timestamp}.jpg"
-            saved_path = save_rgb_image(task_frame, str(output_path))
-            print(f"Saved webcam frame to: {saved_path}")
+            saved_webcam_frame_path = save_rgb_image(task_frame, str(output_path))
+            print(f"Saved webcam frame to: {saved_webcam_frame_path}")
 
     print(f"frame shape: {task_frame.shape}")
     print(f"frame dtype: {task_frame.dtype}")
@@ -691,10 +788,40 @@ def main() -> None:
 
         recorded_episode = None
         if recorder is not None:
+            if args.record_perception_metadata:
+                episode_metadata = build_episode_metadata(
+                    episode_id=recorder.episode_dir.name if recorder.episode_dir else "",
+                    task_goal=task_goal,
+                    input_source=build_input_source_section(args, saved_webcam_frame_path),
+                    detections=build_detections_section(detections),
+                    selected_target=build_selected_target_section(detection, sim_object_type),
+                    real2sim=build_real2sim_section(args.real2sim_mode, mapping_debug),
+                    wrist_camera=build_wrist_camera_section(
+                        args.wrist_camera_mode, final_state.get("wrist_refinement_debug")
+                    ),
+                    robot=build_robot_section(args.policy, policy_steps, final_state),
+                    result=build_result_section(final_state, bin_position, success),
+                    episode_tag=args.episode_tag,
+                )
+                recorder.update_metadata(episode_metadata)
+
             episode_record = recorder.finish_episode(final_state=final_state, success=success, status=final_status)
             recorded_episode = episode_record["episode_dir"]
             print(f"\nEpisode saved to: {recorded_episode}")
             print(f"num_steps: {episode_record['num_steps']}")
+
+            if args.record_perception_metadata:
+                metadata_path = write_episode_metadata_file(recorded_episode, episode_metadata)
+                print(f"Episode metadata saved to: {metadata_path}")
+
+            if args.record_images:
+                copy_perception_artifacts_into_episode(
+                    Path(recorded_episode),
+                    saved_webcam_frame_path=saved_webcam_frame_path,
+                    saved_debug_path=saved_debug_path,
+                    mapping_debug=mapping_debug,
+                    wrist_refinement_debug=final_state.get("wrist_refinement_debug"),
+                )
 
         print("\n=== Full Demo Finished ===")
         print(f"policy: {args.policy}")

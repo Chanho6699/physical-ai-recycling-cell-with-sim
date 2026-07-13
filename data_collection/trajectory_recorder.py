@@ -82,6 +82,23 @@ class TrajectoryRecorder:
 
         return self._episode_id
 
+    @property
+    def episode_dir(self) -> Optional[Path]:
+        return self._episode_dir
+
+    def update_metadata(self, extra: dict) -> None:
+        """Merges additional fields into the current episode's metadata
+        dict after start_episode() -- for information (e.g. wrist camera
+        refinement outcome, final robot/result summary) that isn't known
+        until partway through or at the very end of the episode. Anything
+        set here still flows through to the metadata the exporter copies
+        from raw episodes, since it lands in the same self._metadata dict
+        start_episode()'s metadata argument populates.
+        """
+        if self._episode_dir is None:
+            raise RuntimeError("start_episode() must be called before update_metadata().")
+        self._metadata.update(to_jsonable(extra))
+
     def record_step(
         self,
         phase: str,
