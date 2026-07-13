@@ -131,3 +131,123 @@ python -m benchmark.probe_real2sim_mapping \
 ```
 
 `--image-path`, `--camera-index`, `--real2sim-calibration`(기본 `configs/real2sim_webcam_calibration.json`)도 `run_full_recycling_cell_demo.py`와 동일하게 지원합니다. 출력의 `=== Real2Sim Mapping Debug ===` 블록(`bbox_center`, `bbox_size`, `normalized_center`, `clamped`, `mapped_position` 등)으로 같은 물체를 카메라에서 가깝게/멀게/좌우로 옮겼을 때 `mapped_position`이 실제로 달라지는지 비교하세요. `--save-debug-image`를 주면 detection bbox뿐 아니라 calibration ROI 사각형도 함께 그려서 저장합니다.
+
+## 10. ArUco marker 생성
+
+테이블 작업영역 네 모서리에 붙일 marker 4장을 PNG로 생성합니다. 인쇄해서 실제 테이블에 붙인 뒤 아래 ArUco probe/full demo를 사용하세요.
+
+```bash
+python -m benchmark.generate_aruco_markers \
+  --dictionary DICT_4X4_50 \
+  --marker-ids 0 1 2 3 \
+  --marker-size-px 600 \
+  --output-dir results/aruco_markers
+```
+
+`cv2.aruco`가 설치되어 있지 않으면 traceback 없이 안내 메시지와 함께 `FAIL`을 출력합니다.
+
+## 11. ArUco table-plane mapping probe
+
+PyBullet 없이 detection + marker 검출 + homography mapping만 확인합니다. marker 4개(0~3)가 화면에 모두 보이는 상태에서 실행하세요.
+
+```bash
+python -m benchmark.probe_aruco_real2sim_mapping \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --save-debug-image
+```
+
+`--aruco-calibration`(기본 `configs/real2sim_aruco_table_calibration.json`)로 marker id/`sim_xy`/dictionary를 바꿀 수 있습니다. marker가 4개 미만 감지되면 `ArUco mapping failed: required markers [...], detected [...]`를 출력하고 traceback 없이 `FAIL`로 끝납니다.
+
+## 12. Full demo에서 ArUco mapping 사용
+
+`--real2sim-mode aruco`를 주면 `run_full_recycling_cell_demo.py`가 ROI 매핑 대신 ArUco homography 매핑을 사용합니다(marker가 4개 모두 보여야 PyBullet 단계까지 진행됩니다).
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --save-webcam-frame \
+  --save-debug-image \
+  --headless
+```
+
+marker가 부족하면 PyBulletPandaBackend를 아예 생성하지 않고 `FAIL`로 끝납니다. `--real2sim-mode roi`(기본값)로 기존 ROI 매핑 방식을 그대로 쓸 수 있습니다.
+
+## 13. Wrist camera probe
+
+외부 카메라/YOLO/ArUco 없이 PyBullet 안에서만, Panda 손목에 붙인 가상 카메라(`PyBulletWristCamera`)가 지정한 위치의 물체를 실제로 볼 수 있는지 확인합니다.
+
+```bash
+python -m benchmark.probe_pybullet_wrist_camera \
+  --object-position 0.40 -0.10 0.05 \
+  --headless \
+  --save-images
+```
+
+기대 결과: `object_visible: True`, `position_error_xy <= 0.05`, `PASS`. `--gui`로 실행하면 GUI 창에서 직접 확인할 수 있습니다. `--wrist-camera-config`로 `configs/wrist_camera_config.json`을 교체할 수 있습니다.
+
+## 14. Full demo에서 wrist camera observe 모드 사용
+
+`--wrist-camera-mode observe`를 주면 Real2Sim mapping으로 정한 위치 위쪽으로 end-effector를 한 번 이동시켜 wrist camera로 관찰하고, 추정 위치를 실제 위치와 비교해서 출력합니다. **관찰만 하고 policy의 grasp target은 바꾸지 않으며, 이후 pick-and-place는 기존과 동일하게 수행됩니다.**
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --wrist-camera-mode observe \
+  --save-wrist-camera-images \
+  --save-webcam-frame \
+  --save-debug-image \
+  --headless
+```
+
+`--wrist-camera-mode off`(기본값)는 기존 동작 그대로입니다. wrist camera 이미지/depth/segmentation/debug JSON은 `results/wrist_camera/`에 저장됩니다.
+
+## 15. Wrist camera grasp refinement 확인
+
+PyBullet 안에서만, 일부러 offset을 준 "coarse" target을 wrist camera 추정값으로 실제 물체 위치 쪽으로 보정하는지 확인합니다.
+
+```bash
+python -m benchmark.probe_wrist_grasp_refinement \
+  --object-position 0.40 -0.10 0.05 \
+  --coarse-offset 0.04 -0.03 \
+  --policy blend \
+  --headless \
+  --save-images
+```
+
+기대 결과: `refinement_applied: True`, `error_after_xy < error_before_xy`, `PASS`. `--policy override`(x/y 완전 대체)와 `--policy none`(관찰만, 항상 fallback)도 지원합니다.
+
+## 16. Full demo에서 wrist camera refine 모드 사용
+
+`--wrist-camera-mode refine`을 주면(현재 `--policy dummy-openvla`에서만 연결됨) `move_to_object` phase가 grasp 직전(`--refine-distance-threshold` 이내)에 도달했을 때 딱 한 번 wrist camera로 물체 위치를 다시 추정하고, 신뢰 조건을 만족하면 `--wrist-refinement-policy`(기본 `blend`)로 grasp target의 x/y를 보정합니다.
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --confidence-threshold 0.10 \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --save-wrist-camera-images \
+  --save-webcam-frame \
+  --save-debug-image \
+  --gui \
+  --policy-step-delay 0.08
+```
+
+기대 결과: `=== Wrist Camera Grasp Refinement ===` 출력, `refinement_applied: True`(신뢰 조건을 만족할 때), `final_status: success`, **PASS**. 최종 요약에도 `wrist_refinement_applied`/`wrist_refinement_delta_xy`가 함께 출력됩니다. 신뢰 조건(안 보임/픽셀 부족/보정폭 초과)을 만족하지 못하면 원래 coarse target 그대로 pick-and-place를 진행합니다(fallback).

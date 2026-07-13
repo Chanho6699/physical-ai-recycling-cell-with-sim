@@ -51,6 +51,12 @@ from real2sim.calibrated_image_to_sim_mapper import (
 from real2sim.recyclable_object_mapper import RecyclableObjectMapper
 from robot_sim.camera_utils import save_rgb_image
 from robot_sim.pybullet_panda_backend import PyBulletPandaBackend
+from robot_sim.pybullet_wrist_camera import (
+    PyBulletWristCamera,
+    print_wrist_refinement_debug,
+    refine_target_with_wrist_camera,
+    save_wrist_camera_outputs,
+)
 from safety.mock_safety_monitor import MockSafetyMonitor
 from safety.safety_gate import SafetyGate
 from vision.webcam_source import WebcamSource
@@ -61,6 +67,14 @@ DEFAULT_INSTRUCTION = "플라스틱 병을 플라스틱 수거함에 넣어줘"
 
 DEFAULT_CALIBRATION_CONFIG = "configs/real2sim_webcam_calibration.json"
 DEFAULT_ARUCO_CALIBRATION = "configs/real2sim_aruco_table_calibration.json"
+DEFAULT_WRIST_CAMERA_CONFIG = "configs/wrist_camera_config.json"
+WRIST_CAMERA_OUTPUT_DIR = "results/wrist_camera"
+
+# How far above the object (in the object's own xy) the end effector
+# moves to before rendering the wrist camera in --wrist-camera-mode
+# observe -- matches the "look straight down" pose the default
+# configs/wrist_camera_config.json's camera_forward_local expects.
+WRIST_CAMERA_OBSERVE_HEIGHT = 0.25
 
 # The scripted policy issues one big move_end_effector_to() call per
 # action rather than small per-step deltas, so it doesn't hit the
@@ -96,6 +110,16 @@ def parse_args() -> argparse.Namespace:
     debug_group.add_argument("--print-mapping-debug", dest="print_mapping_debug", action="store_true")
     debug_group.add_argument("--no-print-mapping-debug", dest="print_mapping_debug", action="store_false")
     parser.set_defaults(print_mapping_debug=True)
+
+    parser.add_argument("--wrist-camera-mode", choices=["off", "observe", "refine"], default="off")
+    parser.add_argument("--wrist-camera-config", type=str, default=DEFAULT_WRIST_CAMERA_CONFIG)
+    parser.add_argument("--save-wrist-camera-images", action="store_true")
+
+    parser.add_argument("--wrist-refinement-policy", choices=["none", "blend", "override"], default="blend")
+    parser.add_argument("--wrist-refinement-alpha", type=float, default=0.7)
+    parser.add_argument("--refine-distance-threshold", type=float, default=0.08)
+    parser.add_argument("--wrist-min-object-pixels", type=int, default=50)
+    parser.add_argument("--wrist-max-refinement-delta", type=float, default=0.08)
 
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
@@ -193,6 +217,51 @@ def load_webcam_frame(args):
         source.close()
 
 
+def observe_wrist_camera(args, backend, sim_position: list) -> None:
+    """--wrist-camera-mode observe: move above the object, render the
+    wrist camera, and report how well it can re-locate the object from
+    up close -- purely diagnostic. Nothing here changes sim_position or
+    any policy target; pick-and-place runs exactly as it would with
+    --wrist-camera-mode off right after this returns.
+    """
+    observe_position = [sim_position[0], sim_position[1], sim_position[2] + WRIST_CAMERA_OBSERVE_HEIGHT]
+    backend.move_end_effector_to(observe_position)
+
+    wrist_camera = PyBulletWristCamera(
+        client_id=backend.client_id,
+        robot_id=backend.robot_id,
+        config_path=resolve(args.wrist_camera_config),
+    )
+    frame, render_debug = wrist_camera.render()
+    estimated_position, estimate_debug = wrist_camera.estimate_object_position_from_segmentation(
+        frame, backend._object_id
+    )
+
+    print("\n=== Wrist Camera Observation ===")
+    print(f"object_visible: {estimate_debug['object_visible']}")
+    if estimate_debug["object_visible"]:
+        print(f"object_pixel_count: {estimate_debug['object_pixel_count']}")
+        print(f"estimated_world_position: {estimated_position}")
+        print(f"gt_object_position: {sim_position}")
+        position_error_xy = math.sqrt(
+            (estimated_position[0] - sim_position[0]) ** 2 + (estimated_position[1] - sim_position[1]) ** 2
+        )
+        print(f"position_error_xy: {position_error_xy:.4f}")
+    else:
+        print("Wrist camera could not see the object from the observe position.")
+
+    if args.save_wrist_camera_images:
+        saved_paths = save_wrist_camera_outputs(
+            frame,
+            {**render_debug, **estimate_debug},
+            resolve(WRIST_CAMERA_OUTPUT_DIR),
+            save_depth_colormap=wrist_camera.save_depth_colormap,
+            save_segmentation_mask=wrist_camera.save_segmentation_mask,
+            extra_debug={"object_position_gt": sim_position},
+        )
+        print(f"Saved wrist camera outputs: {saved_paths}")
+
+
 def blocked_state(state: dict, action_name: str, reason: str) -> dict:
     final_state = dict(state)
     final_state["task_status"] = "blocked_by_safety"
@@ -276,6 +345,7 @@ def run_dummy_openvla_policy(
     bin_position,
     policy_step_delay: float = 0.0,
     simulation_step_delay: float = 0.0,
+    wrist_camera=None,
 ):
     action_adapter = ActionAdapter()
     policy = DummyOpenVLAPolicy(
@@ -287,15 +357,55 @@ def run_dummy_openvla_policy(
     policy.reset()
 
     state = backend.get_state()
+    target_object_position = list(sim_position)
+    wrist_refinement_state = {
+        "wrist_refinement_attempted": False,
+        "wrist_refinement_applied": False,
+        "wrist_refinement_delta_xy": None,
+    }
+
+    def with_wrist_refinement_info(state_dict: dict) -> dict:
+        return {**state_dict, **wrist_refinement_state}
 
     for step_index in range(args.max_policy_steps):
         robot_state = backend.get_state()
+
+        # Refine the grasp target exactly once, right as the arm is
+        # closing in on the object (not before -- an early wrist-camera
+        # look from far away, still mostly seeing the gripper/background,
+        # would be far less reliable than one taken this close).
+        if (
+            wrist_camera is not None
+            and args.wrist_camera_mode == "refine"
+            and not wrist_refinement_state["wrist_refinement_attempted"]
+            and policy.phase == "move_to_object"
+            and not robot_state.get("held_object", False)
+            and (policy.last_info or {}).get("distance_to_target") is not None
+            and policy.last_info["distance_to_target"] <= args.refine_distance_threshold
+        ):
+            wrist_refinement_state["wrist_refinement_attempted"] = True
+            refined_position, refinement_debug = refine_target_with_wrist_camera(
+                backend,
+                wrist_camera,
+                target_object_position,
+                backend._object_id,
+                mode=args.wrist_refinement_policy,
+                blend_alpha=args.wrist_refinement_alpha,
+                min_object_pixels=args.wrist_min_object_pixels,
+                max_refinement_delta=args.wrist_max_refinement_delta,
+            )
+            print()
+            print_wrist_refinement_debug(refinement_debug)
+            target_object_position = refined_position
+            wrist_refinement_state["wrist_refinement_applied"] = refinement_debug["refinement_applied"]
+            wrist_refinement_state["wrist_refinement_delta_xy"] = refinement_debug["xy_delta_from_coarse"]
+
         policy_input = PolicyInput(
             image=task_frame,
             instruction=args.instruction,
             robot_state=robot_state,
             task_goal=asdict(task_goal),
-            target_object_position=sim_position,
+            target_object_position=target_object_position,
             bin_position=bin_position,
             step_index=step_index,
             phase=policy.phase,
@@ -321,7 +431,7 @@ def run_dummy_openvla_policy(
                         safety=safety_record,
                         image=task_frame if args.record_images else None,
                     )
-                return final_state, step_index + 1
+                return with_wrist_refinement_info(final_state), step_index + 1
 
         state = backend.apply_command(robot_command, steps=args.steps_per_action, step_delay=simulation_step_delay)
 
@@ -349,9 +459,9 @@ def run_dummy_openvla_policy(
             time.sleep(policy_step_delay)
 
         if state["task_status"] == "success" or policy_output.done:
-            return state, step_index + 1
+            return with_wrist_refinement_info(state), step_index + 1
 
-    return state, args.max_policy_steps
+    return with_wrist_refinement_info(state), args.max_policy_steps
 
 
 def main() -> None:
@@ -531,6 +641,20 @@ def main() -> None:
             )
             recorder.record_step(phase="reset", action_name="reset", robot_state=state)
 
+        if args.wrist_camera_mode == "observe":
+            observe_wrist_camera(args, backend, sim_position)
+
+        wrist_camera = None
+        if args.wrist_camera_mode == "refine":
+            if args.policy != "dummy-openvla":
+                print("--wrist-camera-mode refine is only wired into --policy dummy-openvla; ignoring for scripted.")
+            else:
+                wrist_camera = PyBulletWristCamera(
+                    client_id=backend.client_id,
+                    robot_id=backend.robot_id,
+                    config_path=resolve(args.wrist_camera_config),
+                )
+
         print("\n=== Policy Execution ===")
         if args.policy == "scripted":
             final_state, policy_steps = run_scripted_policy(
@@ -556,6 +680,7 @@ def main() -> None:
                 bin_position,
                 policy_step_delay=policy_step_delay,
                 simulation_step_delay=simulation_step_delay,
+                wrist_camera=wrist_camera,
             )
 
         print("\n=== Final State ===")
@@ -577,6 +702,9 @@ def main() -> None:
         print(f"final_status: {final_status}")
         print(f"last_event: {final_state['last_event']}")
         print(f"recorded_episode: {recorded_episode}")
+        if args.wrist_camera_mode == "refine":
+            print(f"wrist_refinement_applied: {final_state.get('wrist_refinement_applied')}")
+            print(f"wrist_refinement_delta_xy: {final_state.get('wrist_refinement_delta_xy')}")
 
         if final_status in ("success", "blocked_by_safety"):
             print("PASS")
