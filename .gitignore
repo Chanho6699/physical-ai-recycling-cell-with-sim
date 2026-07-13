@@ -31,6 +31,7 @@ weights/*.pt
 weights/*.pth
 weights/*.onnx
 weights/*.engine
+weights/*.task
 
 # Dataset
 datasets/*
@@ -65,3 +66,10 @@ results/logs/*.jsonl
 results/camera/*.png
 results/camera/*.jpg
 results/camera/*.jpeg
+results/webcam/*.png
+results/webcam/*.jpg
+results/webcam/*.jpeg
+results/aruco_markers/*.png
+results/wrist_camera/*.png
+results/wrist_camera/*.json
+results/safety_hand_debug/

@@ -91,10 +91,15 @@ def main() -> None:
     safety = metadata.get("safety", {})
     if safety.get("mode", "off") != "off":
         print(f"safety_mode: {safety.get('mode')}")
-        print(f"mock_hand_intrusion: {safety.get('mock_hand_intrusion')}")
+        print(f"hand_safety_source: {safety.get('hand_safety_source')}")
+        if safety.get("hand_safety_source") == "external-camera":
+            print(f"hand_detector_backend: {safety.get('hand_detector_backend')}")
+        else:
+            print(f"mock_hand_intrusion: {safety.get('mock_hand_intrusion')}")
         print(f"safety_pause_count: {safety.get('pause_count')}")
         print(f"safety_resume_count: {safety.get('resume_count')}")
         print(f"paused_steps: {safety.get('paused_steps')}")
+        print(f"hand_intrusion_events: {safety.get('hand_intrusion_events')}")
         print(f"final_safety_state: {safety.get('final_safety_state')}")
 
     robot = metadata.get("robot", {})

@@ -393,9 +393,9 @@ python -m benchmark.run_full_recycling_cell_demo \
 
 서버가 꺼져 있거나 `--policy-server-url`이 틀리면, PyBullet을 켜기 전에 `/health` 확인 단계에서 안내 메시지와 함께 `FAIL`로 끝납니다(traceback 없음).
 
-## 24. Safety Pause/Resume 확인 (mock-timed hand intrusion)
+## 24. Safety Pause/Resume 확인 (mock-timed hand intrusion, v0)
 
-`--safety-mode pause-resume`는 `--safety-monitor`(hazard 발생 시 episode를 `blocked_by_safety`로 종료)와는 별개의 경로입니다: hazard 동안 로봇 action 적용만 멈추고, hazard가 사라지면 같은 episode/policy phase를 이어서 진행합니다. v0는 실제 hand detector 없이 `--mock-hand-start-step`/`--mock-hand-end-step` 구간 동안 손이 있는 것처럼 흉내 냅니다.
+`--safety-mode pause-resume`는 `--safety-monitor`(hazard 발생 시 episode를 `blocked_by_safety`로 종료)와는 별개의 경로입니다: hazard 동안 로봇 action 적용만 멈추고, hazard가 사라지면 같은 episode/policy phase를 이어서 진행합니다. v0는 실제 hand detector 없이 `--hand-safety-source mock`(`--mock-hand-start-step`/`--mock-hand-end-step` 구간 동안 손이 있는 것처럼 흉내)을 사용합니다. `--hand-safety-source`의 기본값은 `none`이므로, mock으로 pause를 발생시키려면 반드시 `--hand-safety-source mock`을 함께 줘야 합니다.
 
 먼저 최소 구성으로 상태 머신만 확인하려면:
 
@@ -419,6 +419,7 @@ python -m benchmark.run_full_recycling_cell_demo \
   --wrist-refinement-policy blend \
   --policy-observation-source wrist \
   --safety-mode pause-resume \
+  --hand-safety-source mock \
   --mock-hand-intrusion \
   --mock-hand-start-step 10 \
   --mock-hand-end-step 20 \
@@ -429,7 +430,56 @@ python -m benchmark.run_full_recycling_cell_demo \
 
 기대 결과: `safety_mode: pause-resume`, `safety_pause_count: 1`, `safety_resume_count: 1`, `paused_steps: 13`, `final_status: success`, `PASS`. 저장된 episode는 `benchmark/inspect_recorded_episode.py --episode-dir <경로>`로 같은 요약을 다시 확인할 수 있습니다.
 
-`--policy-backend fastapi-dummy`(21번처럼 서버를 먼저 띄운 뒤)로도 동일하게 `--safety-mode pause-resume --mock-hand-intrusion`만 추가하면 같은 `safety_pause_count`/`safety_resume_count`/`paused_steps`로 끝납니다(같은 `DummyOpenVLAPolicy`를 그대로 실행하기 때문). 실제 iVCam + ArUco 조합(`--image-source webcam --camera-url ... --real2sim-mode aruco`)도 동일하게 `--safety-mode pause-resume`만 추가하면 되지만, 카메라 화면 안에 실제로 플라스틱 병이 있어야 YOLO detection부터 통과합니다 -- 화면에 병이 없으면 pause/resume 이전 단계(`No detections found`)에서 끝나는 것이 정상입니다.
+`--policy-backend fastapi-dummy`(21번처럼 서버를 먼저 띄운 뒤)로도 동일하게 `--hand-safety-source mock --mock-hand-intrusion`만 추가하면 같은 `safety_pause_count`/`safety_resume_count`/`paused_steps`로 끝납니다(같은 `DummyOpenVLAPolicy`를 그대로 실행하기 때문).
+
+## 25. External Camera Hand Safety Monitor 확인 (실제 hand/arm intrusion, v1)
+
+v1은 mock-timed 신호 대신 실제 외부 카메라 frame에서 MediaPipe HandLandmarker로 손/팔을 검출합니다. 먼저 모델을 한 번 받아둡니다(커스텀 학습 아닌, Google 공개 배포 pretrained 모델):
+
+```bash
+mkdir -p weights
+curl -sL -o weights/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+```
+
+단독 probe로 손 검출 + 작업공간 polygon 판정만 확인하려면:
+
+```bash
+python -m benchmark.probe_external_camera_hand_safety_monitor \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --hand-safety-config configs/hand_safety_config.json \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --save-debug-image
+```
+
+기대 결과(손이 작업공간 polygon 안에 있을 때): `workspace_valid: True`, `hand_detected: True`, `hand_in_workspace: True`, `safety_decision: emergency_stop=True`, `reason: hand_in_workspace`, `PASS`. 손이 없을 때는 `hand_detected: False`, `safety_decision: emergency_stop=False`, `PASS`(probe는 검출 여부와 무관하게 정상 종료면 항상 PASS). ArUco 마커 4개를 모두 못 찾으면 `workspace_valid: False`로 나오고 `configs/hand_safety_config.json`의 `roi.enabled`가 켜져 있지 않은 한 pause는 절대 일어나지 않습니다.
+
+전체 데모에서는 `--hand-safety-source external-camera`만 추가하면 됩니다(mock과 정확히 같은 pause/resume state machine을 그대로 사용):
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --policy-backend local-dummy \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --confidence-threshold 0.10 \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --safety-mode pause-resume \
+  --hand-safety-source external-camera \
+  --save-hand-safety-debug-images \
+  --record --record-images \
+  --record-perception-metadata --record-policy-observations \
+  --gui \
+  --policy-step-delay 0.08
+```
+
+손이 없으면 `hand_detected: False`, `safety_pause_count: 0`, `final_status: success`, `PASS`. 로봇이 움직이는 중 실제로 손을 ArUco workspace 안에 넣으면 `hand_detected: True`, `hand_in_workspace: True`, `safety_pause_count: 1`, 손을 빼면 (`--safety-resume-stable-steps`, 기본 3프레임 연속 clear 후) `safety_resume_count: 1`, 최종적으로 `final_status: success`, `PASS`. 이 조합도 카메라 화면 안에 실제로 ArUco 마커 4개와 플라스틱 병이 있어야 YOLO detection부터 통과합니다 -- 화면에 마커/병이 없으면 pause/resume 이전 단계(`No detections found`)에서 끝나는 것이 정상입니다. `--save-hand-safety-debug-images`를 주면 매 step `results/safety_hand_debug/hand_safety_step_<step>.png`에 workspace polygon/손 landmark/bbox/상태 텍스트가 그려진 디버그 이미지가 저장됩니다.
 
 ## Deprecated: 구식 `/predict_action` 데모
 

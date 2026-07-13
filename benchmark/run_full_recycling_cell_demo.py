@@ -74,6 +74,7 @@ from robot_sim.pybullet_wrist_camera import (
     refine_target_with_wrist_camera,
     save_wrist_camera_outputs,
 )
+from safety.external_camera_hand_monitor import ExternalCameraHandSafetyMonitor, save_hand_safety_debug_image
 from safety.mock_hand_intrusion_monitor import MockHandIntrusionMonitor
 from safety.mock_safety_monitor import MockSafetyMonitor
 from safety.safety_gate import SafetyGate
@@ -87,6 +88,8 @@ DEFAULT_CALIBRATION_CONFIG = "configs/real2sim_webcam_calibration.json"
 DEFAULT_ARUCO_CALIBRATION = "configs/real2sim_aruco_table_calibration.json"
 DEFAULT_WRIST_CAMERA_CONFIG = "configs/wrist_camera_config.json"
 WRIST_CAMERA_OUTPUT_DIR = "results/wrist_camera"
+DEFAULT_HAND_SAFETY_CONFIG = "configs/hand_safety_config.json"
+HAND_SAFETY_DEBUG_OUTPUT_DIR = "results/safety_hand_debug"
 
 # How far above the object (in the object's own xy) the end effector
 # moves to before rendering the wrist camera in --wrist-camera-mode
@@ -157,6 +160,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mock-hand-start-step", type=int, default=10)
     parser.add_argument("--mock-hand-end-step", type=int, default=20)
     parser.add_argument("--safety-resume-stable-steps", type=int, default=3)
+
+    parser.add_argument("--hand-safety-source", choices=["none", "mock", "external-camera"], default="none")
+    parser.add_argument("--hand-safety-config", type=str, default=DEFAULT_HAND_SAFETY_CONFIG)
+    parser.add_argument("--save-hand-safety-debug-images", action="store_true")
 
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--record-images", action="store_true")
@@ -230,6 +237,26 @@ def build_safety_gate(args, model_path: Path):
     from safety.onnx_yolo_safety_monitor import ONNXRuntimeYOLOSafetyMonitor
 
     return SafetyGate(ONNXRuntimeYOLOSafetyMonitor(model_path=str(model_path)))
+
+
+def build_hand_safety_workspace_polygon(args, mapping_debug: dict):
+    """4 ArUco marker centers (in required_marker_ids perimeter order --
+    front_left/front_right/back_right/back_left, matching how
+    draw_aruco_debug_image already draws the table polygon) reused as
+    the hand-safety workspace polygon, so the hand monitor doesn't need
+    its own marker detection pass. Returns None if ArUco mapping isn't
+    in use or didn't find every required marker this frame --
+    ExternalCameraHandSafetyMonitor falls back to its own config ROI
+    (or stays workspace_valid=False) in that case."""
+    if args.real2sim_mode != "aruco" or not mapping_debug.get("homography_valid"):
+        return None
+
+    required_ids = mapping_debug.get("required_marker_ids") or []
+    marker_centers = mapping_debug.get("marker_centers_px") or {}
+    if not required_ids or not all(str(marker_id) in marker_centers for marker_id in required_ids):
+        return None
+
+    return [marker_centers[str(marker_id)] for marker_id in required_ids]
 
 
 def load_webcam_frame(args):
@@ -435,6 +462,7 @@ def run_dummy_openvla_policy(
     simulation_step_delay: float = 0.0,
     wrist_camera=None,
     hand_intrusion_gate=None,
+    hand_safety_frame_provider=None,
 ):
     action_adapter = ActionAdapter()
     if args.policy_backend == "fastapi-dummy":
@@ -477,9 +505,12 @@ def run_dummy_openvla_policy(
     stable_clear_steps = 0
     safety_info = {
         "safety_mode": args.safety_mode,
+        "hand_safety_source": args.hand_safety_source,
+        "hand_detector_backend": "mediapipe" if args.hand_safety_source == "external-camera" else None,
         "safety_pause_count": 0,
         "safety_resume_count": 0,
         "paused_steps": 0,
+        "hand_intrusion_events": 0,
         "final_safety_state": "running",
     }
 
@@ -529,16 +560,52 @@ def run_dummy_openvla_policy(
             )
             policy_observation_state["used_wrist_observation_steps"] += 1
 
+        # Safety check happens before any target refinement/update or
+        # policy call (see docs/architecture.md's Safety Pause/Resume
+        # section for the required per-step ordering): observation
+        # above is allowed to run every step even while paused, but
+        # hand_detected must be known before deciding whether this
+        # step's refinement/policy/action should apply at all.
+        hand_detected = False
+        hand_safety_debug = None
+        if args.safety_mode == "pause-resume" and hand_intrusion_gate is not None:
+            hand_intrusion_gate.safety_monitor.set_step(step_index)
+            safety_check_frame = hand_safety_frame_provider() if hand_safety_frame_provider is not None else task_frame
+            hand_gate_result = hand_intrusion_gate.check(safety_check_frame, "safety_check")
+            hand_detected = hand_gate_result.decision.emergency_stop
+            hand_safety_debug = getattr(hand_intrusion_gate.safety_monitor, "last_debug", None)
+
+            if args.hand_safety_source == "external-camera" and args.save_hand_safety_debug_images:
+                debug_for_image = hand_safety_debug or {
+                    "hand_detected": hand_detected,
+                    "hand_in_workspace": hand_detected,
+                    "hand_landmarks_px": [],
+                    "hand_bbox_px": None,
+                    "workspace_polygon_px": None,
+                    "intrusion_points_px": [],
+                    "step_index": step_index,
+                }
+                saved_hand_debug_path = save_hand_safety_debug_image(
+                    safety_check_frame, debug_for_image, resolve(HAND_SAFETY_DEBUG_OUTPUT_DIR)
+                )
+            else:
+                saved_hand_debug_path = None
+
         # Refine the grasp target exactly once, right as the arm is
         # closing in on the object (not before -- an early wrist-camera
         # look from far away, still mostly seeing the gripper/background,
-        # would be far less reliable than one taken this close).
+        # would be far less reliable than one taken this close). Skipped
+        # entirely while paused/resuming so the grasp target does not
+        # keep shifting underneath a stopped robot; it can still fire
+        # after the episode resumes, using a fresh observation.
         if (
             wrist_camera is not None
             and args.wrist_camera_mode == "refine"
             and not wrist_refinement_state["wrist_refinement_attempted"]
             and policy.phase == "move_to_object"
             and not robot_state.get("held_object", False)
+            and not hand_detected
+            and safety_state == "running"
             and (policy.last_info or {}).get("distance_to_target") is not None
             and policy.last_info["distance_to_target"] <= args.refine_distance_threshold
         ):
@@ -581,32 +648,39 @@ def run_dummy_openvla_policy(
                 print(f"Saved wrist camera outputs: {saved_wrist_paths}")
                 refinement_event["saved_wrist_camera_paths"] = saved_wrist_paths
 
-        # Safety Pause/Resume v0: mock-timed hand-intrusion check runs
-        # every step, before the policy is ever called, so that a paused
-        # step neither invokes the policy nor applies a robot command.
+        # Safety Pause/Resume v0/v1 state machine transition, reusing
+        # hand_detected computed above (before refinement) -- the actual
+        # detector (mock-timed or external-camera) never changes this
+        # logic, only which SafetyMonitor produced hand_detected.
         if args.safety_mode == "pause-resume" and hand_intrusion_gate is not None:
-            hand_intrusion_gate.safety_monitor.set_step(step_index)
-            hand_gate_result = hand_intrusion_gate.check(task_frame, "safety_check")
-            hand_detected = hand_gate_result.decision.emergency_stop
+            intrusion_reason = hand_gate_result.decision.reason if hand_detected else None
+            still_paused_reason = "hand_in_workspace" if args.hand_safety_source == "external-camera" else "mock_hand_intrusion"
+            hand_in_workspace = (hand_safety_debug or {}).get("hand_in_workspace")
+            hand_bbox_px = (hand_safety_debug or {}).get("hand_bbox_px")
 
             safety_event = None
             if hand_detected:
                 stable_clear_steps = 0
                 if safety_state == "running":
-                    safety_state = "paused_by_safety"
                     safety_info["safety_pause_count"] += 1
+                    safety_info["hand_intrusion_events"] += 1
                     event_type = "safety_pause"
                 else:
-                    safety_state = "paused_by_safety"
                     event_type = "safety_still_paused"
+                safety_state = "paused_by_safety"
                 safety_info["paused_steps"] += 1
                 safety_event = {
                     "event_type": event_type,
-                    "reason": "mock_hand_intrusion",
+                    "reason": intrusion_reason or still_paused_reason,
                     "safety_mode": args.safety_mode,
+                    "hand_safety_source": args.hand_safety_source,
                     "robot_action_applied": False,
                     "hand_detected": True,
                 }
+                if hand_in_workspace is not None:
+                    safety_event["hand_in_workspace"] = hand_in_workspace
+                if hand_bbox_px is not None:
+                    safety_event["hand_bbox_px"] = hand_bbox_px
             elif safety_state in ("paused_by_safety", "resuming"):
                 stable_clear_steps += 1
                 safety_info["paused_steps"] += 1
@@ -616,6 +690,8 @@ def run_dummy_openvla_policy(
                     safety_event = {
                         "event_type": "safety_resume",
                         "reason": "hand_cleared",
+                        "safety_mode": args.safety_mode,
+                        "hand_safety_source": args.hand_safety_source,
                         "stable_clear_steps": stable_clear_steps,
                         "robot_action_applied": False,
                         "hand_detected": False,
@@ -625,7 +701,9 @@ def run_dummy_openvla_policy(
                     safety_state = "resuming"
                     safety_event = {
                         "event_type": "safety_still_paused",
-                        "reason": "mock_hand_intrusion",
+                        "reason": still_paused_reason,
+                        "safety_mode": args.safety_mode,
+                        "hand_safety_source": args.hand_safety_source,
                         "stable_clear_steps": stable_clear_steps,
                         "robot_action_applied": False,
                         "hand_detected": False,
@@ -913,7 +991,9 @@ def main() -> None:
     safety_gate = build_safety_gate(args, model_path)
 
     hand_intrusion_gate = None
-    if args.safety_mode == "pause-resume":
+    hand_safety_camera_source = None
+    hand_safety_frame_provider = None
+    if args.safety_mode == "pause-resume" and args.hand_safety_source == "mock":
         hand_intrusion_gate = SafetyGate(
             MockHandIntrusionMonitor(
                 start_step=args.mock_hand_start_step,
@@ -921,6 +1001,30 @@ def main() -> None:
                 active=args.mock_hand_intrusion,
             )
         )
+    elif args.safety_mode == "pause-resume" and args.hand_safety_source == "external-camera":
+        try:
+            hand_monitor = ExternalCameraHandSafetyMonitor(config_path=resolve(args.hand_safety_config))
+        except (RuntimeError, FileNotFoundError) as exc:
+            print(str(exc))
+            print("FAIL")
+            return
+
+        workspace_polygon_px = build_hand_safety_workspace_polygon(args, mapping_debug)
+        hand_monitor.set_workspace_polygon(workspace_polygon_px)
+        print("=== Hand Safety Workspace ===")
+        print(f"workspace_valid: {workspace_polygon_px is not None}")
+        hand_intrusion_gate = SafetyGate(hand_monitor)
+
+        if args.image_source == "webcam":
+            try:
+                hand_safety_camera_source = WebcamSource(camera_index=args.camera_index, camera_url=args.camera_url)
+                hand_safety_camera_source.warmup(2)
+                hand_safety_frame_provider = hand_safety_camera_source.get_frame
+            except RuntimeError as exc:
+                print(f"Could not open a live external camera for hand safety monitoring: {exc}")
+                print("Falling back to the single initial detection frame for every hand safety check.")
+        if hand_safety_frame_provider is None:
+            hand_safety_frame_provider = lambda: task_frame
 
     backend = PyBulletPandaBackend(gui=args.gui)
     recorder = TrajectoryRecorder(output_dir=args.output_dir) if args.record else None
@@ -1012,6 +1116,7 @@ def main() -> None:
                 simulation_step_delay=simulation_step_delay,
                 wrist_camera=wrist_camera,
                 hand_intrusion_gate=hand_intrusion_gate,
+                hand_safety_frame_provider=hand_safety_frame_provider,
             )
 
         print("\n=== Final State ===")
@@ -1098,6 +1203,8 @@ def main() -> None:
                 time.sleep(KEEP_SECONDS)
     finally:
         backend.close()
+        if hand_safety_camera_source is not None:
+            hand_safety_camera_source.close()
 
 
 if __name__ == "__main__":

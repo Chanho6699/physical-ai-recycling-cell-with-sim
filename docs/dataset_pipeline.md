@@ -73,11 +73,12 @@ Safety Pause/Resume은 VLA policy 바깥에서 동작합니다 -- policy는 매 
 `metadata.json`의 `safety` 섹션(`build_safety_section()`)에는 episode 전체 요약이 남습니다:
 
 ```json
-{"safety": {"mode": "pause-resume", "mock_hand_intrusion": true,
- "pause_count": 1, "resume_count": 1, "paused_steps": 13, "final_safety_state": "running"}}
+{"safety": {"mode": "pause-resume", "hand_safety_source": "external-camera",
+ "hand_detector_backend": "mediapipe", "pause_count": 1, "resume_count": 1,
+ "paused_steps": 8, "hand_intrusion_events": 1, "final_safety_state": "running"}}
 ```
 
-v0은 mock-timed(`--mock-hand-start-step`/`--mock-hand-end-step` 구간을 손이 있는 것처럼 흉내)이며, 실제 hand/person detector는 future work입니다. `--safety-mode off`(기본값)/`block`은 이 기능 이전과 동일하게 동작하고, `pause_count`/`resume_count`/`paused_steps`는 모두 0으로 남습니다.
+`--hand-safety-source`가 실제 hand intrusion 신호의 출처를 결정합니다: `mock`(v0, `--mock-hand-start-step`/`--mock-hand-end-step` 구간을 손이 있는 것처럼 흉내)과 `external-camera`(v1, MediaPipe HandLandmarker로 실제 외부 카메라 frame에서 손을 검출)가 정확히 같은 pause/resume state machine과 episode/metadata 스키마를 공유합니다 -- `reason` 필드만 `"mock_hand_intrusion"` 대 `"hand_in_workspace"`로 다릅니다. `hand_intrusion_events`는 raw hand-in-workspace 감지 횟수(현재는 pause_count와 동일하게 집계), `hand_detector_backend`는 `external-camera`일 때만 `"mediapipe"`로 채워집니다. `--safety-mode off`(기본값)/`block`은 이 기능 이전과 동일하게 동작하고, `pause_count`/`resume_count`/`paused_steps`/`hand_intrusion_events`는 모두 0으로 남습니다.
 
 **아직 official LeRobot 포맷은 아닙니다** -- 여전히 이 프로젝트 고유의 JSONL/PNG 기반 raw 포맷이고, 이미지/비디오/parquet 공식 변환은 future work로 남아 있습니다 (5번 참고).
 
@@ -137,13 +138,13 @@ gripper_action[t]    = "close" | "open" | "hold"   (gripper_width[t+1] - gripper
 
 ## 5. Episode inspector
 
-`benchmark/inspect_recorded_episode.py --episode-dir <경로>`가 `metadata.json`(없으면 `episode.json`의 `metadata` 필드로 fallback)을 읽어서 instruction, real2sim mode/mapped position, wrist camera refinement 적용 여부와 몇 번째 step에서 일어났는지, `safety_mode`가 `off`가 아니면 `safety_pause_count`/`safety_resume_count`/`paused_steps`/`final_safety_state`, policy_backend(및 `fastapi-dummy`면 `avg_inference_latency_ms`), policy_steps, final_status를 한 화면에 요약합니다. 전체 JSON을 열어보지 않고도 이 episode에서 무슨 일이 있었는지 빠르게 확인하는 용도입니다.
+`benchmark/inspect_recorded_episode.py --episode-dir <경로>`가 `metadata.json`(없으면 `episode.json`의 `metadata` 필드로 fallback)을 읽어서 instruction, real2sim mode/mapped position, wrist camera refinement 적용 여부와 몇 번째 step에서 일어났는지, `safety_mode`가 `off`가 아니면 `hand_safety_source`(+`external-camera`면 `hand_detector_backend`, 아니면 `mock_hand_intrusion`)/`safety_pause_count`/`safety_resume_count`/`paused_steps`/`hand_intrusion_events`/`final_safety_state`, policy_backend(및 `fastapi-dummy`면 `avg_inference_latency_ms`), policy_steps, final_status를 한 화면에 요약합니다. 전체 JSON을 열어보지 않고도 이 episode에서 무슨 일이 있었는지 빠르게 확인하는 용도입니다.
 
 ## 6. 앞으로 (future)
 
 - LeRobot 공식 parquet/video 포맷으로 변환하는 exporter 추가
 - HuggingFace Hub 업로드 (아직 하지 않음)
-- Safety Pause/Resume: mock-timed hand intrusion을 실제 hand/person detector(외부 카메라 또는 wrist camera 기반)로 교체
+- Safety Pause/Resume: 외부 카메라 hand intrusion detector(v1, `--hand-safety-source external-camera`)에 이어 wrist camera 기반 hand safety, 외부+wrist 카메라 fusion, 실제 하드웨어 ROS2 e-stop 브릿지
 - 실제 OpenVLA fine-tuning에 이 dataset을 사용하는 것 (아직 하지 않음)
 - 회전(δroll/δpitch/δyaw)이 실제로 의미를 갖는 조작(물체 방향 조정 등)이 추가되면 그에 맞춰 action 정의 확장
 - 지금은 `frames/`에 wrist camera rgb/depth/segmentation 이미지 자체를 복사하지 않고 `results/wrist_camera/`의 경로만 step 이벤트에 남깁니다 -- episode 폴더를 완전히 독립적으로 만들려면 이 파일들도 함께 복사하는 것이 다음 개선 지점입니다.

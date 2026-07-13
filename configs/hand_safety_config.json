@@ -1,0 +1,21 @@
+{
+  "monitor_name": "external_camera_hand_safety_v1",
+  "camera_source": "external",
+  "detector_backend": "mediapipe",
+  "model_asset_path": "weights/hand_landmarker.task",
+  "fallback_backend": "none",
+  "workspace_mode": "aruco_polygon",
+  "min_detection_confidence": 0.5,
+  "min_tracking_confidence": 0.5,
+  "pause_if_hand_in_workspace": true,
+  "resume_stable_frames": 3,
+  "save_debug_images": true,
+  "debug_output_dir": "results/safety_hand_debug",
+  "roi": {
+    "enabled": false,
+    "x_min": 0,
+    "y_min": 0,
+    "x_max": 640,
+    "y_max": 480
+  }
+}

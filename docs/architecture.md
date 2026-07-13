@@ -96,11 +96,26 @@ frame → SafetyMonitor.check(frame) → SafetyDecision(emergency_stop, reason, 
 5. 안전하면: policy action 생성 -> ActionAdapter -> apply_command()
 ```
 
-상태 머신은 `running -> paused_by_safety -> (resuming) -> running`으로 움직입니다. 손이 사라져도 곧바로 재개하지 않고, `--safety-resume-stable-steps`(기본 3)번 연속으로 `hand_detected=False`가 나와야 `safety_resume` 이벤트와 함께 다음 step부터 정상 control loop를 이어갑니다 -- 재개된 step은 policy phase/target을 그대로 유지하므로 episode를 처음부터 다시 실행하지 않습니다. pause/resume이 몇 번 일어나든 최종적으로 물체를 놓으면 `final_status=success`이며, pause 자체는 절대로 episode를 실패시키지 않습니다.
+상태 머신은 `running -> paused_by_safety -> (resuming) -> running`으로 움직입니다. 손이 사라져도 곧바로 재개하지 않고, `--safety-resume-stable-steps`(기본 3)번 연속으로 `hand_detected=False`가 나와야 `safety_resume` 이벤트와 함께 다음 step부터 정상 control loop를 이어갑니다 -- 재개된 step은 policy phase/target을 그대로 유지하므로 episode를 처음부터 다시 실행하지 않습니다. pause/resume이 몇 번 일어나든 최종적으로 물체를 놓으면 `final_status=success`이며, pause 자체는 절대로 episode를 실패시키지 않습니다. wrist camera grasp refinement도 `hand_detected=True`이거나 아직 재개 대기(`resuming`) 중일 때는 적용하지 않습니다 -- 로봇이 멈춰 있는 동안 grasp target이 계속 바뀌지 않도록, refinement는 `safety_state == "running"`일 때만 시도되고, 재개 이후 새 observation으로 다시 시도할 수 있습니다.
 
 `--safety-mode`는 세 가지 값을 가집니다: `off`(기본값, 이 기능 이전과 완전히 동일한 동작), `block`(기존 `--safety-monitor mock/onnx` + `--simulate-hazard` 차단 경로를 그대로 유지, 회귀 없음), `pause-resume`(위에서 설명한 새 상태 머신). `--safety-monitor`/`--simulate-hazard`와 `--safety-mode`/`--mock-hand-intrusion`은 서로 독립적인 축이라 동시에 켤 수도 있습니다.
 
-향후 방향은 실제 hand/person detector(예: 외부 카메라 또는 wrist camera에 대한 사람 손 검출 모델)로 `MockHandIntrusionMonitor`를 대체하는 것이며, `SafetyMonitor` 인터페이스만 만족하면 control loop 쪽 코드는 바뀌지 않습니다.
+### External Camera Hand Safety Monitor (v1, real hand/arm intrusion)
+
+v0의 `MockHandIntrusionMonitor`는 시간(step index)만 보고 손을 흉내 냈습니다. v1은 실제 외부 카메라 frame에서 손/팔을 검출합니다: `safety/external_camera_hand_monitor.py`의 `ExternalCameraHandSafetyMonitor`가 MediaPipe HandLandmarker(Tasks API, `weights/hand_landmarker.task` 사전학습 모델 -- 커스텀 학습 아님)로 손 landmark를 찾고, 그 landmark가 **ArUco 마커 4개로 정의된 작업공간 polygon** 내부에 들어오는지 `cv2.pointPolygonTest`로 판정합니다. 분리수거 작업의 핵심은 사람 전체가 보이는지가 아니라 테이블 위로 손/팔 일부가 들어오는지이므로, person detector가 아니라 **hand/arm intrusion detector** 중심으로 설계했습니다. 손이 화면에 보여도 작업공간 polygon 밖이면 pause하지 않습니다(`hand_detected=True, hand_in_workspace=False`).
+
+`ExternalCameraHandSafetyMonitor`는 `MockHandIntrusionMonitor`와 정확히 같은 duck-typed 인터페이스(`set_step()`, `check(frame) -> SafetyDecision`)를 구현하므로, `run_full_recycling_cell_demo.py`의 pause/resume control loop 코드는 전혀 바뀌지 않고 `--hand-safety-source mock` -> `external-camera`로 SafetyMonitor 구현체만 바뀝니다:
+
+```text
+--safety-mode pause-resume --hand-safety-source mock --mock-hand-intrusion   (v0, 시간 기반)
+--safety-mode pause-resume --hand-safety-source external-camera             (v1, 실제 손 검출)
+```
+
+작업공간 polygon은 ArUco Real2Sim mapping이 이미 검출한 marker 4개의 pixel 중심(`marker_centers_px`, `required_marker_ids` 순서 = front_left/front_right/back_right/back_left)을 그대로 재사용합니다(`build_hand_safety_workspace_polygon()`) -- hand safety monitor가 자체적으로 marker를 다시 검출하지 않습니다. ArUco 마커를 못 찾으면 `configs/hand_safety_config.json`의 `roi` 블록으로 fallback하고, 그것도 없으면 `workspace_valid=False`로 기록되어 절대 pause하지 않습니다(오탐으로 인한 불필요한 정지보다 "판정 불가능은 안전 쪽으로 무시"를 선택). 외부 카메라는 `--image-source webcam`일 때 매 control loop step마다 새 frame을 읽어(`WebcamSource`를 별도로 열어 둔 채 유지) 실제 실시간 감시를 흉내 냅니다; `--image-source image`(정적 이미지)에서는 라이브 재촬영이 불가능하므로 최초 프레임을 계속 재사용합니다.
+
+`SafetyDecision`에 `severity`(`"high"`/`"none"`) 필드가 추가되어 hand intrusion 같은 고심각도 이벤트를 표시할 수 있습니다. `--save-hand-safety-debug-images`를 주면 매 step `results/safety_hand_debug/hand_safety_step_<step>.png`에 workspace polygon/손 landmark/bbox/침입 지점/`SAFE`|`HAND_IN_WORKSPACE` 상태 텍스트를 그린 디버그 이미지를 저장합니다.
+
+향후 방향: wrist camera 기반 hand safety(그리퍼에 더 가까운 손 침입 감지), 외부+wrist 카메라 fusion, 실제 하드웨어에서 이 SafetyDecision을 ROS2 e-stop/hardware stop 브릿지로 전달하는 것.
 
 ### PyBullet Panda Backend
 

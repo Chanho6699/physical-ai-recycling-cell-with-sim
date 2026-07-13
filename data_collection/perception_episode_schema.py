@@ -129,17 +129,23 @@ def build_policy_observation_section(final_state: dict) -> dict:
 
 
 def build_safety_section(safety_mode: str, mock_hand_intrusion: bool, final_state: dict) -> dict:
-    """Safety Pause/Resume v0 summary: mode is outside the VLA policy
+    """Safety Pause/Resume summary: mode is outside the VLA policy
     entirely -- the policy proposes actions every step regardless, and
     this section (plus the per-step safety_pause/safety_still_paused/
     safety_resume events) records when the Safety Gate paused their
-    application and for how long."""
+    application and for how long. hand_safety_source distinguishes v0
+    mock-timed intrusion from v1's real external-camera hand detector
+    (see safety/external_camera_hand_monitor.py); both drive the exact
+    same pause/resume state machine."""
     return {
         "mode": safety_mode,
         "mock_hand_intrusion": mock_hand_intrusion,
+        "hand_safety_source": final_state.get("hand_safety_source", "none"),
+        "hand_detector_backend": final_state.get("hand_detector_backend"),
         "pause_count": final_state.get("safety_pause_count", 0),
         "resume_count": final_state.get("safety_resume_count", 0),
         "paused_steps": final_state.get("paused_steps", 0),
+        "hand_intrusion_events": final_state.get("hand_intrusion_events", 0),
         "final_safety_state": final_state.get("final_safety_state", "running"),
     }
 
