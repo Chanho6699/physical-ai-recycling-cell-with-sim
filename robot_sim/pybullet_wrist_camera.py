@@ -324,6 +324,7 @@ def refine_target_with_wrist_camera(
     blend_alpha: float = 0.7,
     min_object_pixels: int = DEFAULT_MIN_OBJECT_PIXELS,
     max_refinement_delta: float = DEFAULT_MAX_REFINEMENT_DELTA,
+    frame: Optional[dict] = None,
 ) -> Tuple[list, dict]:
     """Renders the wrist camera from wherever the end effector currently
     is (the caller is expected to only call this once it's already near
@@ -337,6 +338,10 @@ def refine_target_with_wrist_camera(
     rest of this module's helpers and in case a future revision needs it
     (e.g. re-querying object velocity for a moving-object case).
 
+    `frame`: pass an already-rendered wrist_camera.render() result (e.g.
+    from this same control-loop step's --policy-observation-source wrist
+    render) to skip rendering again; renders fresh when omitted.
+
     mode:
       none      always falls back (observe-only, no correction)
       blend     refined_xy = (1-alpha)*coarse_xy + alpha*wrist_xy
@@ -348,7 +353,8 @@ def refine_target_with_wrist_camera(
     multi-view or filtering), while the existing object_z is already a
     known constant from the Real2Sim mapping.
     """
-    frame, _render_debug = wrist_camera.render()
+    if frame is None:
+        frame, _render_debug = wrist_camera.render()
     estimated_position, estimate_debug = wrist_camera.estimate_object_position_from_segmentation(
         frame, object_body_id
     )
@@ -412,3 +418,23 @@ def print_wrist_refinement_debug(debug: dict) -> None:
     print(f"refined_target_position: {debug['refined_target_position']}")
     if "fallback_reason" in debug:
         print(f"fallback_reason: {debug['fallback_reason']}")
+
+
+def build_wrist_observation_metadata(step_index: int, frame: dict, render_debug: dict, estimate_debug: dict) -> dict:
+    """Per-step VLA-ready observation record: reuses render()'s and
+    estimate_object_position_from_segmentation()'s outputs directly (no
+    separate vision logic here) so a control loop can attach a summary
+    of "what the wrist camera saw this step" to PolicyInput/episode
+    recording without recomputing anything.
+    """
+    return {
+        "step_index": step_index,
+        "observation_source": "wrist",
+        "image_shape": list(frame["rgb"].shape),
+        "object_visible": estimate_debug["object_visible"],
+        "object_pixel_count": estimate_debug["object_pixel_count"],
+        "object_bbox_px": estimate_debug["object_bbox_px"],
+        "object_center_px": estimate_debug["object_center_px"],
+        "estimated_world_position": estimate_debug["estimated_world_position"],
+        "camera_world_position": render_debug["camera_world_position"],
+    }

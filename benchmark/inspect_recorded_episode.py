@@ -72,6 +72,12 @@ def main() -> None:
         print(f"homography_valid: {real2sim.get('homography_valid')}")
         print(f"out_of_bounds: {real2sim.get('out_of_bounds')}")
 
+    policy_observation = metadata.get("policy_observation", {})
+    if policy_observation.get("policy_observation_source", "none") != "none":
+        print(f"policy_observation_source: {policy_observation.get('policy_observation_source')}")
+        print(f"used_wrist_observation_steps: {policy_observation.get('used_wrist_observation_steps')}")
+        print(f"recorded_wrist_observation_steps: {policy_observation.get('recorded_wrist_observation_steps')}")
+
     wrist_camera = metadata.get("wrist_camera", {})
     print(f"wrist_camera_mode: {wrist_camera.get('mode')}")
     if wrist_camera.get("mode") not in (None, "off"):

@@ -43,6 +43,7 @@ from data_collection.perception_episode_schema import (
     build_detections_section,
     build_episode_metadata,
     build_input_source_section,
+    build_policy_observation_section,
     build_real2sim_section,
     build_result_section,
     build_robot_section,
@@ -66,6 +67,7 @@ from robot_sim.camera_utils import save_rgb_image
 from robot_sim.pybullet_panda_backend import PyBulletPandaBackend
 from robot_sim.pybullet_wrist_camera import (
     PyBulletWristCamera,
+    build_wrist_observation_metadata,
     print_wrist_refinement_debug,
     refine_target_with_wrist_camera,
     save_wrist_camera_outputs,
@@ -133,6 +135,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refine-distance-threshold", type=float, default=0.08)
     parser.add_argument("--wrist-min-object-pixels", type=int, default=50)
     parser.add_argument("--wrist-max-refinement-delta", type=float, default=0.08)
+
+    parser.add_argument("--policy-observation-source", choices=["none", "wrist"], default="none")
+    parser.add_argument("--record-policy-observations", action="store_true")
+    parser.add_argument("--policy-observation-save-interval", type=int, default=5)
 
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
@@ -433,13 +439,46 @@ def run_dummy_openvla_policy(
         "wrist_refinement_delta_xy": None,
         "wrist_refinement_debug": None,
     }
+    policy_observation_state = {
+        "policy_observation_source": args.policy_observation_source,
+        "used_wrist_observation_steps": 0,
+        "recorded_wrist_observation_steps": 0,
+    }
 
     def with_wrist_refinement_info(state_dict: dict) -> dict:
-        return {**state_dict, **wrist_refinement_state}
+        return {**state_dict, **wrist_refinement_state, **policy_observation_state}
 
     for step_index in range(args.max_policy_steps):
         robot_state = backend.get_state()
         refinement_event = None
+        wrist_observation_metadata = None
+
+        # VLA-ready per-step observation: render the wrist camera and feed
+        # it into PolicyInput.image every step (not gated by phase/distance
+        # the way refinement below is) -- this is the loop shape a real
+        # VLA/visual policy would see, even though DummyOpenVLAPolicy
+        # itself doesn't do any visual reasoning on it yet.
+        policy_image = task_frame
+        observation_source = None
+        visual_observation = None
+        wrist_frame = None
+
+        if wrist_camera is not None and args.policy_observation_source == "wrist":
+            wrist_frame, wrist_render_debug = wrist_camera.render()
+            _, wrist_estimate_debug = wrist_camera.estimate_object_position_from_segmentation(
+                wrist_frame, backend._object_id
+            )
+            policy_image = wrist_frame["rgb"]
+            observation_source = "wrist"
+            visual_observation = {
+                "object_visible": wrist_estimate_debug["object_visible"],
+                "object_pixel_count": wrist_estimate_debug["object_pixel_count"],
+                "estimated_world_position": wrist_estimate_debug["estimated_world_position"],
+            }
+            wrist_observation_metadata = build_wrist_observation_metadata(
+                step_index, wrist_frame, wrist_render_debug, wrist_estimate_debug
+            )
+            policy_observation_state["used_wrist_observation_steps"] += 1
 
         # Refine the grasp target exactly once, right as the arm is
         # closing in on the object (not before -- an early wrist-camera
@@ -464,6 +503,7 @@ def run_dummy_openvla_policy(
                 blend_alpha=args.wrist_refinement_alpha,
                 min_object_pixels=args.wrist_min_object_pixels,
                 max_refinement_delta=args.wrist_max_refinement_delta,
+                frame=wrist_frame,
             )
             print()
             print_wrist_refinement_debug(refinement_debug)
@@ -493,7 +533,7 @@ def run_dummy_openvla_policy(
                 refinement_event["saved_wrist_camera_paths"] = saved_wrist_paths
 
         policy_input = PolicyInput(
-            image=task_frame,
+            image=policy_image,
             instruction=args.instruction,
             robot_state=robot_state,
             task_goal=asdict(task_goal),
@@ -501,9 +541,43 @@ def run_dummy_openvla_policy(
             bin_position=bin_position,
             step_index=step_index,
             phase=policy.phase,
+            observation_source=observation_source,
+            visual_observation=visual_observation,
         )
         policy_output = policy.predict_action(policy_input)
         robot_command = action_adapter.convert(policy_output.action)
+
+        policy_observation_event = None
+        if args.record_policy_observations and observation_source == "wrist":
+            policy_observation_event = {
+                "policy_input": {
+                    "image_source": observation_source,
+                    "image_shape": list(policy_image.shape),
+                    "has_image": True,
+                },
+                "wrist_observation": {
+                    "object_visible": visual_observation["object_visible"],
+                    "object_pixel_count": visual_observation["object_pixel_count"],
+                    "object_bbox_px": wrist_observation_metadata["object_bbox_px"],
+                    "estimated_world_position": visual_observation["estimated_world_position"],
+                },
+                "policy_output": {"action": policy_output.action},
+            }
+
+        if (
+            args.record_images
+            and wrist_frame is not None
+            and recorder is not None
+            and recorder.episode_dir is not None
+            and step_index % max(args.policy_observation_save_interval, 1) == 0
+        ):
+            wrist_step_image_path = recorder.episode_dir / "frames" / f"wrist_policy_step_{step_index:06d}.png"
+            save_rgb_image(policy_image, str(wrist_step_image_path))
+            policy_observation_state["recorded_wrist_observation_steps"] += 1
+
+        step_extra = None
+        if refinement_event is not None or policy_observation_event is not None:
+            step_extra = {**(refinement_event or {}), **(policy_observation_event or {})}
 
         safety_record = None
         if safety_gate is not None:
@@ -522,7 +596,7 @@ def run_dummy_openvla_policy(
                         robot_state=final_state,
                         safety=safety_record,
                         image=task_frame if args.record_images else None,
-                        extra=refinement_event,
+                        extra=step_extra,
                     )
                 return with_wrist_refinement_info(final_state), step_index + 1
 
@@ -546,7 +620,7 @@ def run_dummy_openvla_policy(
                 action={"type": "openvla_style", "vector": policy_output.action, "info": policy_output.info},
                 safety=safety_record,
                 image=task_frame if args.record_images else None,
-                extra=refinement_event,
+                extra=step_extra,
             )
 
         if policy_step_delay > 0:
@@ -742,9 +816,13 @@ def main() -> None:
             observe_wrist_camera(args, backend, sim_position)
 
         wrist_camera = None
-        if args.wrist_camera_mode == "refine":
+        needs_wrist_camera = args.wrist_camera_mode == "refine" or args.policy_observation_source == "wrist"
+        if needs_wrist_camera:
             if args.policy != "dummy-openvla":
-                print("--wrist-camera-mode refine is only wired into --policy dummy-openvla; ignoring for scripted.")
+                print(
+                    "--wrist-camera-mode refine / --policy-observation-source wrist are only wired into "
+                    "--policy dummy-openvla; ignoring for scripted."
+                )
             else:
                 wrist_camera = PyBulletWristCamera(
                     client_id=backend.client_id,
@@ -801,6 +879,7 @@ def main() -> None:
                     ),
                     robot=build_robot_section(args.policy, policy_steps, final_state),
                     result=build_result_section(final_state, bin_position, success),
+                    policy_observation=build_policy_observation_section(final_state),
                     episode_tag=args.episode_tag,
                 )
                 recorder.update_metadata(episode_metadata)
@@ -832,6 +911,10 @@ def main() -> None:
         if args.wrist_camera_mode == "refine":
             print(f"wrist_refinement_applied: {final_state.get('wrist_refinement_applied')}")
             print(f"wrist_refinement_delta_xy: {final_state.get('wrist_refinement_delta_xy')}")
+        if args.policy_observation_source != "none":
+            print(f"policy_observation_source: {final_state.get('policy_observation_source')}")
+            print(f"used_wrist_observation_steps: {final_state.get('used_wrist_observation_steps')}")
+            print(f"recorded_wrist_observation_steps: {final_state.get('recorded_wrist_observation_steps')}")
 
         if final_status in ("success", "blocked_by_safety"):
             print("PASS")

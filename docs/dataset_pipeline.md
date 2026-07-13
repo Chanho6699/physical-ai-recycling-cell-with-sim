@@ -30,11 +30,14 @@ future: 실제 OpenVLA / LeRobot 학습
 datasets/raw_episodes/episode_<timestamp>_<id>/
   episode.json          # 기존 그대로: step별 robot_state/action/safety(+ extra 이벤트)
   metadata.json          # 신규: 아래 스키마 전체 (episode_id/task_goal/input_source/
-                          #        detections/selected_target/real2sim/wrist_camera/robot/result)
+                          #        detections/selected_target/real2sim/wrist_camera/
+                          #        policy_observation/robot/result)
   frames/
     frame_000000.png ...     # 기존: step별 프레임(--record-images)
     external_webcam_frame.jpg     # 신규(있으면): --save-webcam-frame으로 저장된 원본 웹캠 프레임 복사본
     external_detection_debug.jpg  # 신규(있으면): --save-debug-image로 저장된 detection/mapping debug 이미지 복사본
+    wrist_policy_step_000005.png  # 신규(있으면): --policy-observation-source wrist + --record-images일 때
+                                   #   --policy-observation-save-interval(기본 5) step마다 하나씩
   debug/
     aruco_mapping_debug.json      # 신규: ArUcoTableMapper.map_detection()의 debug dict 전체
                                    #   (roi 모드면 real2sim_mapping_debug.json)
@@ -42,7 +45,11 @@ datasets/raw_episodes/episode_<timestamp>_<id>/
                                    #   refine_target_with_wrist_camera()의 debug dict 전체
 ```
 
-`data_collection/perception_episode_schema.py`가 `metadata.json`의 스키마를 정의합니다(`build_episode_metadata()` 등). 같은 dict를 `TrajectoryRecorder.update_metadata()`로 `episode.json`의 기존 `"metadata"` 필드에도 그대로 병합하므로, exporter가 이미 하던 대로 `metadata`를 그대로 복사하기만 해도 `real2sim`/`wrist_camera`/`selected_target`/`result`가 함께 넘어갑니다(아래 2번 참고). `wrist_camera` refinement가 실제로 일어난 step에는 `record_step(..., extra={"event_type": "wrist_refinement", ...})`로 표시되어, `episode.json`의 `steps` 리스트만 보고도 정확히 몇 번째 step에서 보정이 일어났는지 알 수 있습니다 (`benchmark/inspect_recorded_episode.py`가 이 필드로 `wrist_refinement_step_index`를 찾아 보여줍니다).
+`data_collection/perception_episode_schema.py`가 `metadata.json`의 스키마를 정의합니다(`build_episode_metadata()` 등). 같은 dict를 `TrajectoryRecorder.update_metadata()`로 `episode.json`의 기존 `"metadata"` 필드에도 그대로 병합하므로, exporter가 이미 하던 대로 `metadata`를 그대로 복사하기만 해도 `real2sim`/`wrist_camera`/`policy_observation`/`selected_target`/`result`가 함께 넘어갑니다(아래 2번 참고). `wrist_camera` refinement가 실제로 일어난 step에는 `record_step(..., extra={"event_type": "wrist_refinement", ...})`로 표시되어, `episode.json`의 `steps` 리스트만 보고도 정확히 몇 번째 step에서 보정이 일어났는지 알 수 있습니다 (`benchmark/inspect_recorded_episode.py`가 이 필드로 `wrist_refinement_step_index`를 찾아 보여줍니다).
+
+### VLA-ready per-step observation (`--policy-observation-source wrist`)
+
+`--record-policy-observations`가 켜져 있으면, `--policy-observation-source wrist`가 실제로 관찰을 넣은 step마다 `episode.json`의 그 step에 `policy_input`(`image_source`/`image_shape`/`has_image`), `wrist_observation`(`object_visible`/`object_pixel_count`/`object_bbox_px`/`estimated_world_position`), `policy_output`(`action`)이 `extra`로 함께 기록됩니다. `metadata.json`의 `policy_observation` 섹션에는 episode 전체를 통틀어 `used_wrist_observation_steps`(실제로 wrist 이미지를 policy input으로 사용한 step 수)와 `recorded_wrist_observation_steps`(그중 이미지 파일까지 저장된 step 수)가 요약됩니다. `DummyOpenVLAPolicy`는 이 이미지 내용을 실제로 해석하지 않는 placeholder이지만, 이 구조 덕분에 나중에 real OpenVLA를 같은 `PolicyInput`/`PolicyOutput` 인터페이스로 꽂아 넣어도 기록되는 데이터 형태는 그대로입니다.
 
 **아직 official LeRobot 포맷은 아닙니다** -- 여전히 이 프로젝트 고유의 JSONL/PNG 기반 raw 포맷이고, 이미지/비디오/parquet 공식 변환은 future work로 남아 있습니다 (5번 참고).
 

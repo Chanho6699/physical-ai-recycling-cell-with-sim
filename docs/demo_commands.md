@@ -285,4 +285,41 @@ python -m benchmark.inspect_recorded_episode \
   --episode-dir datasets/raw_episodes/episode_YYYYMMDD_HHMMSS_xxxxxx
 ```
 
-기대 결과: instruction, real2sim mode/mapped position, wrist refinement 적용 여부와 몇 번째 step에서 일어났는지, policy_steps, final_status를 요약 출력하고 성공 episode면 `PASS`.
+기대 결과: instruction, real2sim mode/mapped position, wrist refinement 적용 여부와 몇 번째 step에서 일어났는지, policy_steps, final_status를 요약 출력하고 성공 episode면 `PASS`. `--policy-observation-source wrist`로 기록된 episode면 `policy_observation_source`/`used_wrist_observation_steps`/`recorded_wrist_observation_steps`도 함께 출력됩니다.
+
+## 19. Wrist camera policy input loop 확인 (VLA-ready 여부)
+
+PyBullet 안에서만, `DummyOpenVLAPolicy`가 매 step 실제로 wrist camera RGB를 `PolicyInput.image`로 받고 있는지 빠르게 확인합니다.
+
+```bash
+python -m benchmark.probe_wrist_camera_policy_input_loop \
+  --object-position 0.40 -0.10 0.05 \
+  --headless \
+  --steps 10
+```
+
+기대 결과: 모든 step에서 `has_image=True`, `image_shape=[240, 320, 3]`, `used_wrist_observation_steps: 10`, **PASS**.
+
+## 20. Full demo에서 policy-observation-source wrist 사용
+
+`--policy-observation-source wrist`를 주면(현재 `--policy dummy-openvla`에서만 연결됨) 매 policy step마다 wrist camera로 렌더링한 RGB를 `PolicyInput.image`로 넣고, `object_visible`/`estimated_world_position`을 `PolicyInput.visual_observation`으로 함께 넘깁니다. `--wrist-camera-mode refine`과 동시에 사용하면 같은 step의 렌더링 결과를 재사용해서 wrist camera를 두 번 호출하지 않습니다.
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --confidence-threshold 0.10 \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --record --record-images \
+  --record-perception-metadata --record-policy-observations \
+  --gui \
+  --policy-step-delay 0.08
+```
+
+기대 결과: `homography_valid: True`, `out_of_bounds: False`, `used_wrist_observation_steps > 0`, `wrist_refinement_applied: True`, `final_status: success`, **PASS**. `--policy-observation-save-interval`(기본 5) step마다 하나씩 wrist RGB가 `episode_dir/frames/wrist_policy_step_*.png`로 저장됩니다. `DummyOpenVLAPolicy`는 이 이미지 내용을 실제로 해석하지는 않지만(placeholder), 매 step 이미지가 들어오는 루프 구조 자체는 실제 OpenVLA를 그대로 꽂아 넣을 수 있는 형태입니다.

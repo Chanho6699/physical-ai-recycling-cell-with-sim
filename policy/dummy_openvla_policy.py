@@ -81,6 +81,33 @@ class DummyOpenVLAPolicy(BasePolicy):
         self.move_above_bin_steps = 0
 
     def predict_action(self, policy_input: PolicyInput) -> PolicyOutput:
+        """Thin wrapper around _predict_phase_action(): runs the actual
+        (image-blind) phase state machine unchanged, then records
+        whether/what image input this step carried. DummyOpenVLAPolicy
+        doesn't do any visual reasoning on policy_input.image -- this is
+        just bookkeeping so a real VLA/visual policy implementing the
+        same predict_action(PolicyInput) -> PolicyOutput interface can be
+        dropped in later without the control loop around it changing.
+        """
+        policy_output = self._predict_phase_action(policy_input)
+
+        image = policy_input.image
+        image_input_info = {
+            "used_image_input": image is not None,
+            "image_shape": list(image.shape) if hasattr(image, "shape") else None,
+            "observation_source": policy_input.observation_source,
+        }
+        if policy_input.visual_observation is not None:
+            image_input_info["object_visible"] = policy_input.visual_observation.get("object_visible")
+            image_input_info["estimated_world_position"] = policy_input.visual_observation.get(
+                "estimated_world_position"
+            )
+
+        policy_output.info = {**(policy_output.info or {}), **image_input_info}
+        self.last_info = policy_output.info
+        return policy_output
+
+    def _predict_phase_action(self, policy_input: PolicyInput) -> PolicyOutput:
         current_ee = policy_input.robot_state["end_effector_position"]
         robot_state = policy_input.robot_state
 

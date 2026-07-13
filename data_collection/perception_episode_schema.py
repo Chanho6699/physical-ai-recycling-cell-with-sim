@@ -113,6 +113,18 @@ def build_result_section(final_state: dict, bin_position: list, success: bool) -
     }
 
 
+def build_policy_observation_section(final_state: dict) -> dict:
+    """VLA-readiness summary: how many control-loop steps actually fed a
+    wrist-camera frame into PolicyInput.image (used_wrist_observation_steps)
+    vs. how many of those got a frame saved to disk
+    (recorded_wrist_observation_steps, gated by --policy-observation-save-interval)."""
+    return {
+        "policy_observation_source": final_state.get("policy_observation_source", "none"),
+        "used_wrist_observation_steps": final_state.get("used_wrist_observation_steps", 0),
+        "recorded_wrist_observation_steps": final_state.get("recorded_wrist_observation_steps", 0),
+    }
+
+
 def build_episode_metadata(
     episode_id: str,
     task_goal,
@@ -123,6 +135,7 @@ def build_episode_metadata(
     wrist_camera: dict,
     robot: dict,
     result: dict,
+    policy_observation: Optional[dict] = None,
     episode_tag: Optional[str] = None,
 ) -> dict:
     return {
@@ -135,6 +148,7 @@ def build_episode_metadata(
         "selected_target": selected_target,
         "real2sim": real2sim,
         "wrist_camera": wrist_camera,
+        "policy_observation": policy_observation or {"policy_observation_source": "none"},
         "robot": robot,
         "result": result,
     }
