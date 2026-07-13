@@ -98,6 +98,9 @@ def build_robot_section(policy_name: str, policy_steps: int, final_state: dict) 
     return {
         "simulator": final_state.get("simulator", "pybullet_panda"),
         "policy": policy_name,
+        "policy_backend": final_state.get("policy_backend", "local-dummy"),
+        "policy_server_url": final_state.get("policy_server_url"),
+        "avg_inference_latency_ms": final_state.get("avg_inference_latency_ms"),
         "policy_steps": policy_steps,
         "final_status": final_state.get("task_status"),
         "last_event": final_state.get("last_event"),
@@ -125,6 +128,22 @@ def build_policy_observation_section(final_state: dict) -> dict:
     }
 
 
+def build_safety_section(safety_mode: str, mock_hand_intrusion: bool, final_state: dict) -> dict:
+    """Safety Pause/Resume v0 summary: mode is outside the VLA policy
+    entirely -- the policy proposes actions every step regardless, and
+    this section (plus the per-step safety_pause/safety_still_paused/
+    safety_resume events) records when the Safety Gate paused their
+    application and for how long."""
+    return {
+        "mode": safety_mode,
+        "mock_hand_intrusion": mock_hand_intrusion,
+        "pause_count": final_state.get("safety_pause_count", 0),
+        "resume_count": final_state.get("safety_resume_count", 0),
+        "paused_steps": final_state.get("paused_steps", 0),
+        "final_safety_state": final_state.get("final_safety_state", "running"),
+    }
+
+
 def build_episode_metadata(
     episode_id: str,
     task_goal,
@@ -136,6 +155,7 @@ def build_episode_metadata(
     robot: dict,
     result: dict,
     policy_observation: Optional[dict] = None,
+    safety: Optional[dict] = None,
     episode_tag: Optional[str] = None,
 ) -> dict:
     return {
@@ -149,6 +169,7 @@ def build_episode_metadata(
         "real2sim": real2sim,
         "wrist_camera": wrist_camera,
         "policy_observation": policy_observation or {"policy_observation_source": "none"},
+        "safety": safety or {"mode": "off"},
         "robot": robot,
         "result": result,
     }

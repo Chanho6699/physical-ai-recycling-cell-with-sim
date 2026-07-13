@@ -88,9 +88,24 @@ def main() -> None:
     if refinement_step is not None:
         print(f"wrist_refinement_step_index: {refinement_step['step_index']}")
 
+    safety = metadata.get("safety", {})
+    if safety.get("mode", "off") != "off":
+        print(f"safety_mode: {safety.get('mode')}")
+        print(f"mock_hand_intrusion: {safety.get('mock_hand_intrusion')}")
+        print(f"safety_pause_count: {safety.get('pause_count')}")
+        print(f"safety_resume_count: {safety.get('resume_count')}")
+        print(f"paused_steps: {safety.get('paused_steps')}")
+        print(f"final_safety_state: {safety.get('final_safety_state')}")
+
     robot = metadata.get("robot", {})
     policy_steps = robot.get("policy_steps", episode.get("num_steps"))
     final_status = robot.get("final_status", episode.get("status"))
+    policy_backend = robot.get("policy_backend")
+    if policy_backend:
+        print(f"policy_backend: {policy_backend}")
+        if policy_backend == "fastapi-dummy":
+            print(f"policy_server_url: {robot.get('policy_server_url')}")
+            print(f"avg_inference_latency_ms: {robot.get('avg_inference_latency_ms')}")
     print(f"policy_steps: {policy_steps}")
     print(f"final_status: {final_status}")
 

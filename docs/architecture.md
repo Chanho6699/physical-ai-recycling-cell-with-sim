@@ -82,6 +82,26 @@ frame → SafetyMonitor.check(frame) → SafetyDecision(emergency_stop, reason, 
 
 `--safety-monitor none/mock/onnx` 세 가지 모드를 지원합니다(`none`은 점검 자체를 건너뜀). 별도 데모(`run_task_goal_real2sim_panda_interrupt_demo.py`)에서는 이동 중간에도 주기적으로 점검하는 Layer 2(interruptible motion)까지 구현했습니다.
 
+### Safety Pause/Resume (v0, mock-timed)
+
+위의 `--safety-monitor` 경로는 hazard를 만나면 episode를 `blocked_by_safety`로 **종료**시킵니다. `--safety-mode pause-resume`는 이와 별개의, 종료 대신 **일시정지 후 재개**하는 경로입니다. 중요한 설계 원칙은: **Safety Pause/Resume은 VLA policy 바깥에 있다.** `DummyOpenVLAPolicy`(혹은 실제 VLA)는 "action을 제안"할 뿐이고, 그 action을 실제로 로봇에 적용할지는 전적으로 Safety Gate가 결정합니다. v0에서는 hand/person detector가 없으므로, `MockHandIntrusionMonitor`(`safety/mock_hand_intrusion_monitor.py`)가 `--mock-hand-start-step`/`--mock-hand-end-step` 구간 동안 손이 있는 것처럼 `emergency_stop=True`를 흉내 냅니다.
+
+```text
+매 control loop step:
+1. robot_state 읽기
+2. (필요하면) wrist observation 읽기
+3. safety check: hand_intrusion_gate.check(frame, "safety_check")
+4. 위험하면(hand_detected=True): policy를 아예 호출하지 않고, action도 적용하지 않고
+   safety_pause/safety_still_paused 이벤트만 기록한 뒤 다음 step으로 continue
+5. 안전하면: policy action 생성 -> ActionAdapter -> apply_command()
+```
+
+상태 머신은 `running -> paused_by_safety -> (resuming) -> running`으로 움직입니다. 손이 사라져도 곧바로 재개하지 않고, `--safety-resume-stable-steps`(기본 3)번 연속으로 `hand_detected=False`가 나와야 `safety_resume` 이벤트와 함께 다음 step부터 정상 control loop를 이어갑니다 -- 재개된 step은 policy phase/target을 그대로 유지하므로 episode를 처음부터 다시 실행하지 않습니다. pause/resume이 몇 번 일어나든 최종적으로 물체를 놓으면 `final_status=success`이며, pause 자체는 절대로 episode를 실패시키지 않습니다.
+
+`--safety-mode`는 세 가지 값을 가집니다: `off`(기본값, 이 기능 이전과 완전히 동일한 동작), `block`(기존 `--safety-monitor mock/onnx` + `--simulate-hazard` 차단 경로를 그대로 유지, 회귀 없음), `pause-resume`(위에서 설명한 새 상태 머신). `--safety-monitor`/`--simulate-hazard`와 `--safety-mode`/`--mock-hand-intrusion`은 서로 독립적인 축이라 동시에 켤 수도 있습니다.
+
+향후 방향은 실제 hand/person detector(예: 외부 카메라 또는 wrist camera에 대한 사람 손 검출 모델)로 `MockHandIntrusionMonitor`를 대체하는 것이며, `SafetyMonitor` 인터페이스만 만족하면 control loop 쪽 코드는 바뀌지 않습니다.
+
 ### PyBullet Panda Backend
 
 `robot_sim/pybullet_panda_backend.py`의 `PyBulletPandaBackend`가 실제 Franka Panda URDF를 로드해서 IK 기반 end-effector 이동, gripper open/close, 물체 grasp/place, `task_status` 관리를 담당합니다. `SimulatorBackend` 인터페이스(`reset`, `apply_command`, `get_state`, `close`)를 구현하고 있어서, 이전 단계의 단순 sphere backend(`robot_sim/pybullet_backend.py`)와 같은 방식으로 다룰 수 있습니다.
@@ -151,3 +171,36 @@ ROI linear mapping(`CalibratedImageToSimMapper`)은 여전히 baseline으로 남
 `policy/policy_types.py`의 `PolicyInput`에 `observation_source`/`visual_observation` 필드를 추가했습니다(둘 다 optional, 기본 `None`이라 기존 호출부는 전혀 안 바뀝니다). `DummyOpenVLAPolicy.predict_action()`은 아주 얇은 wrapper로 감쌌습니다 -- 기존 phase 로직(`_predict_phase_action`으로 이름만 옮김)은 한 글자도 안 바꾸고, 그 결과에 `used_image_input`/`image_shape`/`observation_source`/(있으면) `object_visible`/`estimated_world_position`을 `info`에 덧붙이기만 합니다. 즉 **이번 v0은 policy의 action 자체를 이미지로 바꾸지 않습니다** -- 목표는 오직 "VLA가 들어올 수 있는 입출력 루프"를 만드는 것이고, 나중에 real OpenVLA가 같은 `predict_action(PolicyInput) -> PolicyOutput` 인터페이스로 `DummyOpenVLAPolicy`를 대체하면 이 루프가 그대로 재사용됩니다.
 
 `--record-policy-observations`(`--record`와 함께 사용)를 켜면 wrist observation이 일어난 step마다 `episode.json`의 해당 step에 `policy_input`/`wrist_observation`/`policy_output` 정보가 `extra`로 남고, `--record-images`까지 있으면 `--policy-observation-save-interval`(기본 5) step마다 하나씩 wrist RGB 프레임이 `frames/wrist_policy_step_<step>.png`로 저장됩니다.
+
+### Policy backend: `--policy-backend local-dummy | fastapi-dummy`
+
+같은 `--policy dummy-openvla`가 두 가지 **backend**로 실행될 수 있습니다 -- policy 종류(dummy-openvla)와 그 policy를 어디서 실행하는지(local-dummy/fastapi-dummy)를 분리했습니다.
+
+- **local-dummy** (기본값): 지금까지처럼 `policy/dummy_openvla_policy.py`의 `DummyOpenVLAPolicy`를 in-process로 직접 호출합니다. deterministic placeholder.
+- **fastapi-dummy**: 매 step `PolicyInput`을 `openvla_server_dummy/dummy_server.py`(FastAPI)의 `POST /predict`로 전송하고, 응답 action으로 기존 `ActionAdapter`/`RobotCommand` 흐름을 그대로 탑니다. `policy/fastapi_vla_policy_client.py`의 `FastAPIVLAPolicyClient`가 `BasePolicy` 인터페이스(`reset()`/`predict_action()`)를 구현해서, control loop 입장에서는 local-dummy와 완전히 동일하게 보입니다.
+
+**두 backend가 항상 같은 결과를 내는 이유**: `dummy_server.py`가 새로운 phase 로직을 재구현하지 않고, `DummyOpenVLAPolicy`를 **서버 프로세스 안에서 그대로** 인스턴스화해서 호출합니다. 즉 local-dummy와 fastapi-dummy는 물리적으로 다른 프로세스(in-process 함수 호출 vs. HTTP 요청)에서 실행될 뿐, 실제로 action을 계산하는 코드는 완전히 동일합니다. 이 덕분에 같은 full demo에서 두 backend 모두 `final_status=success`가 나옵니다(둘 다 실측 확인, 8~9번 참고).
+
+**request/response**:
+
+```json
+// POST /predict request
+{
+  "instruction": "...", "robot_state": {...}, "task_goal": {...},
+  "target_object_position": [...], "bin_position": [...],
+  "step_index": 12, "phase": "move_to_object",
+  "observation_source": "wrist",
+  "visual_observation": {"object_visible": true, "object_pixel_count": 1234, "estimated_world_position": [...]},
+  "image": {"encoding": "jpg_base64", "shape": [240, 320, 3], "data": "..."}
+}
+// response
+{"action": [...], "phase": "move_to_object", "done": false, "info": {"policy_backend": "fastapi-dummy", ...}}
+```
+
+`image`는 numpy 배열을 그대로 JSON에 넣지 않고 `FastAPIVLAPolicyClient._encode_image()`가 JPEG(quality 조절 가능, 기본 80)로 인코딩한 뒤 base64 문자열로 전송하고, 서버가 다시 디코딩합니다(둘 다 image content를 실제로 해석하지는 않고, `DummyOpenVLAPolicy`의 image-input bookkeeping에만 씀).
+
+`FastAPIVLAPolicyClient.predict_action()`이 요청 왕복 시간을 측정해서 `PolicyOutput.info["inference_latency_ms"]`에 기록합니다(향후 real VLA 모델의 실제 추론 시간과 비교할 수 있는 자리를 미리 만들어 둔 것). connection refused/timeout/invalid response/action 누락은 모두 traceback 없이 사람이 읽을 수 있는 메시지로 안내하고, `run_full_recycling_cell_demo.py`는 PyBullet을 켜기 전에 `/health`를 먼저 확인해서 서버가 없으면 조기에 `FAIL`로 끝납니다.
+
+`GET /health`, `POST /reset`(episode 시작 시 서버의 `DummyOpenVLAPolicy` phase를 리셋)도 있습니다. 서버는 단일 글로벌 policy 인스턴스만 유지하므로, 한 번에 하나의 episode만 구동하는 이번 v0 용도로 충분하고 동시 다중 episode 서빙은 지원하지 않습니다.
+
+**향후**: `openvla_server_dummy/dummy_server.py`의 `/predict` 구현부만 실제 OpenVLA 추론으로 바꾸면, `FastAPIVLAPolicyClient`/`run_full_recycling_cell_demo.py` 어느 쪽도 변경할 필요가 없습니다 -- 지금 이 v0의 request/response 스키마가 바로 그 자리입니다.

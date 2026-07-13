@@ -323,3 +323,114 @@ python -m benchmark.run_full_recycling_cell_demo \
 ```
 
 기대 결과: `homography_valid: True`, `out_of_bounds: False`, `used_wrist_observation_steps > 0`, `wrist_refinement_applied: True`, `final_status: success`, **PASS**. `--policy-observation-save-interval`(기본 5) step마다 하나씩 wrist RGB가 `episode_dir/frames/wrist_policy_step_*.png`로 저장됩니다. `DummyOpenVLAPolicy`는 이 이미지 내용을 실제로 해석하지는 않지만(placeholder), 매 step 이미지가 들어오는 루프 구조 자체는 실제 OpenVLA를 그대로 꽂아 넣을 수 있는 형태입니다.
+
+## 21. FastAPI dummy VLA policy server 실행
+
+터미널 1에서 서버를 띄웁니다(`DummyOpenVLAPolicy`를 그대로 호스팅하는 v0 dummy server).
+
+```bash
+cd ~/Projects/physical-ai-recycling-cell
+source .venv/bin/activate
+uvicorn openvla_server_dummy.dummy_server:app --host 127.0.0.1 --port 8000
+```
+
+기대 결과: `Uvicorn running on http://127.0.0.1:8000`.
+
+## 22. FastAPI policy client probe
+
+터미널 2에서 서버가 살아있는지, `/predict`가 7-DoF action을 정상 반환하는지 확인합니다.
+
+```bash
+python -m benchmark.probe_fastapi_vla_policy_client \
+  --policy-server-url http://127.0.0.1:8000/predict
+```
+
+기대 결과: `health: ok`, `action_len: 7`, `inference_latency_ms: ...`, **PASS**. `--with-image`를 주면 더미 이미지를 JPEG base64로 인코딩해서 함께 보냅니다.
+
+## 23. Full demo에서 fastapi-dummy policy backend 사용
+
+서버가 떠 있는 상태에서, `--policy-backend fastapi-dummy`로 같은 full demo를 돌립니다. `--policy dummy-openvla`는 그대로 두고 backend만 바뀝니다.
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --policy-backend fastapi-dummy \
+  --policy-server-url http://127.0.0.1:8000/predict \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-path data/test_images/recyclable_scene.jpg \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --record \
+  --record-perception-metadata \
+  --record-policy-observations \
+  --headless
+```
+
+기대 결과: `policy_backend: fastapi-dummy`, `used_wrist_observation_steps > 0`, `wrist_refinement_applied: True`, `final_status: success`, `avg_inference_latency_ms: ...`, **PASS** -- local-dummy와 동일한 `policy_steps`로 끝납니다(서버가 같은 `DummyOpenVLAPolicy`를 그대로 실행하기 때문).
+
+실제 iVCam + ArUco 조합도 동일하게 `--policy-backend fastapi-dummy`만 추가하면 됩니다:
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --policy-backend fastapi-dummy \
+  --policy-server-url http://127.0.0.1:8000/predict \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --real2sim-mode aruco \
+  --aruco-calibration configs/real2sim_aruco_table_calibration.json \
+  --confidence-threshold 0.10 \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --record --record-images \
+  --record-perception-metadata --record-policy-observations \
+  --gui \
+  --policy-step-delay 0.08
+```
+
+서버가 꺼져 있거나 `--policy-server-url`이 틀리면, PyBullet을 켜기 전에 `/health` 확인 단계에서 안내 메시지와 함께 `FAIL`로 끝납니다(traceback 없음).
+
+## 24. Safety Pause/Resume 확인 (mock-timed hand intrusion)
+
+`--safety-mode pause-resume`는 `--safety-monitor`(hazard 발생 시 episode를 `blocked_by_safety`로 종료)와는 별개의 경로입니다: hazard 동안 로봇 action 적용만 멈추고, hazard가 사라지면 같은 episode/policy phase를 이어서 진행합니다. v0는 실제 hand detector 없이 `--mock-hand-start-step`/`--mock-hand-end-step` 구간 동안 손이 있는 것처럼 흉내 냅니다.
+
+먼저 최소 구성으로 상태 머신만 확인하려면:
+
+```bash
+python -m benchmark.probe_safety_pause_resume_demo \
+  --mock-hand-start-step 5 \
+  --mock-hand-end-step 10 \
+  --headless
+```
+
+기대 결과: `safety_pause_count: 1`, `safety_resume_count: 1`, `robot_action_applied_during_pause: False`, `final_status: success`, `PASS`.
+
+전체 데모(local-dummy, wrist refinement + policy observation + episode recording 포함)에서:
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-path data/test_images/recyclable_scene.jpg \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --safety-mode pause-resume \
+  --mock-hand-intrusion \
+  --mock-hand-start-step 10 \
+  --mock-hand-end-step 20 \
+  --record --record-images \
+  --record-perception-metadata --record-policy-observations \
+  --headless
+```
+
+기대 결과: `safety_mode: pause-resume`, `safety_pause_count: 1`, `safety_resume_count: 1`, `paused_steps: 13`, `final_status: success`, `PASS`. 저장된 episode는 `benchmark/inspect_recorded_episode.py --episode-dir <경로>`로 같은 요약을 다시 확인할 수 있습니다.
+
+`--policy-backend fastapi-dummy`(21번처럼 서버를 먼저 띄운 뒤)로도 동일하게 `--safety-mode pause-resume --mock-hand-intrusion`만 추가하면 같은 `safety_pause_count`/`safety_resume_count`/`paused_steps`로 끝납니다(같은 `DummyOpenVLAPolicy`를 그대로 실행하기 때문). 실제 iVCam + ArUco 조합(`--image-source webcam --camera-url ... --real2sim-mode aruco`)도 동일하게 `--safety-mode pause-resume`만 추가하면 되지만, 카메라 화면 안에 실제로 플라스틱 병이 있어야 YOLO detection부터 통과합니다 -- 화면에 병이 없으면 pause/resume 이전 단계(`No detections found`)에서 끝나는 것이 정상입니다.
+
+## Deprecated: 구식 `/predict_action` 데모
+
+`openvla_client/client_test.py`, `benchmark/run_pybullet_backend_pipeline.py`, `benchmark/run_task_pipeline.py`, `benchmark/run_dummy_pipeline.py`, `benchmark/run_robot_dummy_pipeline.py`, `benchmark/run_robot_backend_pipeline.py`는 `openvla_server_dummy/dummy_server.py`가 `/predict`, `/health`, `/reset`으로 정리되기 전의 구식 `/predict_action` endpoint를 사용하는 초기 단계 데모라 지금의 서버와 호환되지 않습니다. 각 파일 상단에 deprecated 주석을 남겨뒀고, 이 문서의 권장 경로에는 포함하지 않습니다 -- 대신 21~23번(FastAPI dummy VLA policy backend) 또는 `run_full_recycling_cell_demo.py --policy-backend fastapi-dummy`를 사용하세요.

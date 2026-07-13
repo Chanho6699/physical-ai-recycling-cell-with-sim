@@ -1,3 +1,10 @@
+# Deprecated:
+# This demo used the old /predict_action endpoint, which no longer
+# exists on openvla_server_dummy/dummy_server.py (replaced by /predict,
+# /health, /reset -- see policy/fastapi_vla_policy_client.py).
+# Use benchmark/probe_fastapi_vla_policy_client.py or
+# run_full_recycling_cell_demo.py with --policy-backend fastapi-dummy instead.
+
 import json
 import sys
 import time

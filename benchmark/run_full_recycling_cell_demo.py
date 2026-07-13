@@ -47,6 +47,7 @@ from data_collection.perception_episode_schema import (
     build_real2sim_section,
     build_result_section,
     build_robot_section,
+    build_safety_section,
     build_selected_target_section,
     build_wrist_camera_section,
     write_episode_metadata_file,
@@ -55,6 +56,7 @@ from data_collection.trajectory_recorder import TrajectoryRecorder, to_jsonable
 from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.onnx_yolo_detector import ONNXYOLODetector
 from policy.dummy_openvla_policy import DummyOpenVLAPolicy
+from policy.fastapi_vla_policy_client import FastAPIVLAPolicyClient
 from policy.policy_types import PolicyInput
 from real2sim.aruco_table_mapper import ArUcoTableMapper, draw_aruco_debug_image, print_aruco_mapping_debug
 from real2sim.calibrated_image_to_sim_mapper import (
@@ -72,6 +74,7 @@ from robot_sim.pybullet_wrist_camera import (
     refine_target_with_wrist_camera,
     save_wrist_camera_outputs,
 )
+from safety.mock_hand_intrusion_monitor import MockHandIntrusionMonitor
 from safety.mock_safety_monitor import MockSafetyMonitor
 from safety.safety_gate import SafetyGate
 from vision.webcam_source import WebcamSource
@@ -140,10 +143,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-policy-observations", action="store_true")
     parser.add_argument("--policy-observation-save-interval", type=int, default=5)
 
+    parser.add_argument("--policy-backend", choices=["local-dummy", "fastapi-dummy"], default="local-dummy")
+    parser.add_argument("--policy-server-url", type=str, default="http://127.0.0.1:8000/predict")
+    parser.add_argument("--policy-request-timeout", type=float, default=5.0)
+
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
     parser.add_argument("--safety-monitor", choices=["none", "mock", "onnx"], default="none")
     parser.add_argument("--simulate-hazard", action="store_true")
+
+    parser.add_argument("--safety-mode", choices=["off", "block", "pause-resume"], default="off")
+    parser.add_argument("--mock-hand-intrusion", action="store_true")
+    parser.add_argument("--mock-hand-start-step", type=int, default=10)
+    parser.add_argument("--mock-hand-end-step", type=int, default=20)
+    parser.add_argument("--safety-resume-stable-steps", type=int, default=3)
 
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--record-images", action="store_true")
@@ -421,14 +434,18 @@ def run_dummy_openvla_policy(
     policy_step_delay: float = 0.0,
     simulation_step_delay: float = 0.0,
     wrist_camera=None,
+    hand_intrusion_gate=None,
 ):
     action_adapter = ActionAdapter()
-    policy = DummyOpenVLAPolicy(
-        max_step_size=args.max_step_size,
-        position_tolerance=args.position_tolerance,
-        carry_height=args.carry_height,
-        grasp_z_offset=args.grasp_z_offset,
-    )
+    if args.policy_backend == "fastapi-dummy":
+        policy = FastAPIVLAPolicyClient(server_url=args.policy_server_url, timeout=args.policy_request_timeout)
+    else:
+        policy = DummyOpenVLAPolicy(
+            max_step_size=args.max_step_size,
+            position_tolerance=args.position_tolerance,
+            carry_height=args.carry_height,
+            grasp_z_offset=args.grasp_z_offset,
+        )
     policy.reset()
 
     state = backend.get_state()
@@ -444,9 +461,41 @@ def run_dummy_openvla_policy(
         "used_wrist_observation_steps": 0,
         "recorded_wrist_observation_steps": 0,
     }
+    policy_backend_state = {
+        "policy_backend": args.policy_backend,
+        "policy_server_url": args.policy_server_url if args.policy_backend == "fastapi-dummy" else None,
+        "avg_inference_latency_ms": None,
+    }
+    inference_latencies_ms = []
+
+    # Safety Pause/Resume v0 state machine. Deliberately decoupled from
+    # safety_gate (the existing --safety-monitor mock/onnx hard-block
+    # path, unchanged by this feature): hand_intrusion_gate is only
+    # non-None under --safety-mode pause-resume, and it never fails the
+    # episode -- it only pauses/resumes action application.
+    safety_state = "running"
+    stable_clear_steps = 0
+    safety_info = {
+        "safety_mode": args.safety_mode,
+        "safety_pause_count": 0,
+        "safety_resume_count": 0,
+        "paused_steps": 0,
+        "final_safety_state": "running",
+    }
 
     def with_wrist_refinement_info(state_dict: dict) -> dict:
-        return {**state_dict, **wrist_refinement_state, **policy_observation_state}
+        if inference_latencies_ms:
+            policy_backend_state["avg_inference_latency_ms"] = round(
+                sum(inference_latencies_ms) / len(inference_latencies_ms), 3
+            )
+        safety_info["final_safety_state"] = safety_state
+        return {
+            **state_dict,
+            **wrist_refinement_state,
+            **policy_observation_state,
+            **policy_backend_state,
+            **safety_info,
+        }
 
     for step_index in range(args.max_policy_steps):
         robot_state = backend.get_state()
@@ -532,6 +581,72 @@ def run_dummy_openvla_policy(
                 print(f"Saved wrist camera outputs: {saved_wrist_paths}")
                 refinement_event["saved_wrist_camera_paths"] = saved_wrist_paths
 
+        # Safety Pause/Resume v0: mock-timed hand-intrusion check runs
+        # every step, before the policy is ever called, so that a paused
+        # step neither invokes the policy nor applies a robot command.
+        if args.safety_mode == "pause-resume" and hand_intrusion_gate is not None:
+            hand_intrusion_gate.safety_monitor.set_step(step_index)
+            hand_gate_result = hand_intrusion_gate.check(task_frame, "safety_check")
+            hand_detected = hand_gate_result.decision.emergency_stop
+
+            safety_event = None
+            if hand_detected:
+                stable_clear_steps = 0
+                if safety_state == "running":
+                    safety_state = "paused_by_safety"
+                    safety_info["safety_pause_count"] += 1
+                    event_type = "safety_pause"
+                else:
+                    safety_state = "paused_by_safety"
+                    event_type = "safety_still_paused"
+                safety_info["paused_steps"] += 1
+                safety_event = {
+                    "event_type": event_type,
+                    "reason": "mock_hand_intrusion",
+                    "safety_mode": args.safety_mode,
+                    "robot_action_applied": False,
+                    "hand_detected": True,
+                }
+            elif safety_state in ("paused_by_safety", "resuming"):
+                stable_clear_steps += 1
+                safety_info["paused_steps"] += 1
+                if stable_clear_steps >= args.safety_resume_stable_steps:
+                    safety_state = "running"
+                    safety_info["safety_resume_count"] += 1
+                    safety_event = {
+                        "event_type": "safety_resume",
+                        "reason": "hand_cleared",
+                        "stable_clear_steps": stable_clear_steps,
+                        "robot_action_applied": False,
+                        "hand_detected": False,
+                    }
+                    stable_clear_steps = 0
+                else:
+                    safety_state = "resuming"
+                    safety_event = {
+                        "event_type": "safety_still_paused",
+                        "reason": "mock_hand_intrusion",
+                        "stable_clear_steps": stable_clear_steps,
+                        "robot_action_applied": False,
+                        "hand_detected": False,
+                    }
+
+            if safety_event is not None:
+                print(
+                    f"[step {step_index:02d}] {safety_event['event_type']} "
+                    f"reason={safety_event['reason']} safety_state={safety_state}"
+                )
+                if recorder is not None:
+                    recorder.record_step(
+                        phase=policy.phase,
+                        action_name=safety_event["event_type"],
+                        robot_state=robot_state,
+                        extra=safety_event,
+                    )
+                if policy_step_delay > 0:
+                    time.sleep(policy_step_delay)
+                continue
+
         policy_input = PolicyInput(
             image=policy_image,
             instruction=args.instruction,
@@ -547,22 +662,34 @@ def run_dummy_openvla_policy(
         policy_output = policy.predict_action(policy_input)
         robot_command = action_adapter.convert(policy_output.action)
 
+        policy_output_info = policy_output.info or {}
+        inference_latency_ms = policy_output_info.get("inference_latency_ms")
+        if inference_latency_ms is not None:
+            inference_latencies_ms.append(inference_latency_ms)
+
         policy_observation_event = None
-        if args.record_policy_observations and observation_source == "wrist":
+        if args.record_policy_observations:
             policy_observation_event = {
-                "policy_input": {
+                "policy_output": {
+                    "action": policy_output.action,
+                    "policy_backend": policy_output_info.get("policy_backend", args.policy_backend),
+                    "inference_latency_ms": inference_latency_ms,
+                    "used_image_input": policy_output_info.get("used_image_input"),
+                    "observation_source": policy_output_info.get("observation_source"),
+                }
+            }
+            if observation_source == "wrist":
+                policy_observation_event["policy_input"] = {
                     "image_source": observation_source,
                     "image_shape": list(policy_image.shape),
                     "has_image": True,
-                },
-                "wrist_observation": {
+                }
+                policy_observation_event["wrist_observation"] = {
                     "object_visible": visual_observation["object_visible"],
                     "object_pixel_count": visual_observation["object_pixel_count"],
                     "object_bbox_px": wrist_observation_metadata["object_bbox_px"],
                     "estimated_world_position": visual_observation["estimated_world_position"],
-                },
-                "policy_output": {"action": policy_output.action},
-            }
+                }
 
         if (
             args.record_images
@@ -770,7 +897,31 @@ def main() -> None:
             saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
             print(f"Saved debug detection image to: {saved_debug_path}")
 
+    if args.policy_backend == "fastapi-dummy" and args.policy == "dummy-openvla":
+        health_check_client = FastAPIVLAPolicyClient(
+            server_url=args.policy_server_url, timeout=args.policy_request_timeout
+        )
+        try:
+            health = health_check_client.check_health()
+            print(f"policy_backend: fastapi-dummy ({args.policy_server_url})")
+            print(f"FastAPI VLA policy server health: {health}")
+        except RuntimeError as exc:
+            print(str(exc))
+            print("FAIL")
+            return
+
     safety_gate = build_safety_gate(args, model_path)
+
+    hand_intrusion_gate = None
+    if args.safety_mode == "pause-resume":
+        hand_intrusion_gate = SafetyGate(
+            MockHandIntrusionMonitor(
+                start_step=args.mock_hand_start_step,
+                end_step=args.mock_hand_end_step,
+                active=args.mock_hand_intrusion,
+            )
+        )
+
     backend = PyBulletPandaBackend(gui=args.gui)
     recorder = TrajectoryRecorder(output_dir=args.output_dir) if args.record else None
 
@@ -808,6 +959,7 @@ def main() -> None:
                     "mapped_sim_position": sim_position,
                     "bin_position": bin_position,
                     "safety_monitor": args.safety_monitor,
+                    "safety_mode": args.safety_mode,
                 },
             )
             recorder.record_step(phase="reset", action_name="reset", robot_state=state)
@@ -829,6 +981,9 @@ def main() -> None:
                     robot_id=backend.robot_id,
                     config_path=resolve(args.wrist_camera_config),
                 )
+
+        if args.safety_mode == "pause-resume" and args.policy != "dummy-openvla":
+            print("--safety-mode pause-resume is only wired into --policy dummy-openvla; ignoring for scripted.")
 
         print("\n=== Policy Execution ===")
         if args.policy == "scripted":
@@ -856,6 +1011,7 @@ def main() -> None:
                 policy_step_delay=policy_step_delay,
                 simulation_step_delay=simulation_step_delay,
                 wrist_camera=wrist_camera,
+                hand_intrusion_gate=hand_intrusion_gate,
             )
 
         print("\n=== Final State ===")
@@ -880,6 +1036,7 @@ def main() -> None:
                     robot=build_robot_section(args.policy, policy_steps, final_state),
                     result=build_result_section(final_state, bin_position, success),
                     policy_observation=build_policy_observation_section(final_state),
+                    safety=build_safety_section(args.safety_mode, args.mock_hand_intrusion, final_state),
                     episode_tag=args.episode_tag,
                 )
                 recorder.update_metadata(episode_metadata)
@@ -904,6 +1061,7 @@ def main() -> None:
 
         print("\n=== Full Demo Finished ===")
         print(f"policy: {args.policy}")
+        print(f"policy_backend: {final_state.get('policy_backend', args.policy_backend)}")
         print(f"policy_steps: {policy_steps}")
         print(f"final_status: {final_status}")
         print(f"last_event: {final_state['last_event']}")
@@ -915,6 +1073,13 @@ def main() -> None:
             print(f"policy_observation_source: {final_state.get('policy_observation_source')}")
             print(f"used_wrist_observation_steps: {final_state.get('used_wrist_observation_steps')}")
             print(f"recorded_wrist_observation_steps: {final_state.get('recorded_wrist_observation_steps')}")
+        if args.policy_backend == "fastapi-dummy":
+            print(f"avg_inference_latency_ms: {final_state.get('avg_inference_latency_ms')}")
+        if args.safety_mode != "off":
+            print(f"safety_mode: {args.safety_mode}")
+            print(f"safety_pause_count: {final_state.get('safety_pause_count', 0)}")
+            print(f"safety_resume_count: {final_state.get('safety_resume_count', 0)}")
+            print(f"paused_steps: {final_state.get('paused_steps', 0)}")
 
         if final_status in ("success", "blocked_by_safety"):
             print("PASS")
