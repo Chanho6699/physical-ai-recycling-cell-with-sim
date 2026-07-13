@@ -43,6 +43,17 @@ DEFAULT_GRASP_Z_OFFSET = 0.015
 # enough to place successfully without colliding with it.
 PLACE_APPROACH_CLEARANCE = 0.05
 
+# move_above_bin's tight position_tolerance-based transition can, for an
+# object grasped from an unusual/far-reach position (e.g. near the edge
+# of the Real2Sim workspace), never quite settle within tolerance on
+# every axis at once -- small residual IK error keeps flipping the stage
+# target between carry_height and the descend height, which reads as
+# the arm oscillating/rattling near the bin forever. These two knobs are
+# a bounded escape hatch: open anyway once we're "close enough" by a
+# looser threshold, or once we've spent too long in this phase at all.
+DEFAULT_BIN_OPEN_DISTANCE_THRESHOLD = 0.09
+DEFAULT_MAX_MOVE_ABOVE_BIN_STEPS = 40
+
 
 class DummyOpenVLAPolicy(BasePolicy):
     def __init__(
@@ -51,17 +62,23 @@ class DummyOpenVLAPolicy(BasePolicy):
         position_tolerance: float = DEFAULT_POSITION_TOLERANCE,
         carry_height: float = DEFAULT_CARRY_HEIGHT,
         grasp_z_offset: float = DEFAULT_GRASP_Z_OFFSET,
+        bin_open_distance_threshold: float = DEFAULT_BIN_OPEN_DISTANCE_THRESHOLD,
+        max_move_above_bin_steps: int = DEFAULT_MAX_MOVE_ABOVE_BIN_STEPS,
     ):
         self.max_step_size = max_step_size
         self.position_tolerance = position_tolerance
         self.carry_height = carry_height
         self.grasp_z_offset = grasp_z_offset
+        self.bin_open_distance_threshold = bin_open_distance_threshold
+        self.max_move_above_bin_steps = max_move_above_bin_steps
         self.phase = "move_to_object"
         self.last_info: dict = {}
+        self.move_above_bin_steps = 0
 
     def reset(self) -> None:
         self.phase = "move_to_object"
         self.last_info = {}
+        self.move_above_bin_steps = 0
 
     def predict_action(self, policy_input: PolicyInput) -> PolicyOutput:
         current_ee = policy_input.robot_state["end_effector_position"]
@@ -112,6 +129,7 @@ class DummyOpenVLAPolicy(BasePolicy):
             self.last_info = {"distance_to_target": distance, "target": lift_target}
             if distance <= self.position_tolerance:
                 self.phase = "move_above_bin"
+                self.move_above_bin_steps = 0
             else:
                 return PolicyOutput(
                     action=[delta[0], delta[1], delta[2], 0.0, 0.0, 0.0, 1.0],
@@ -121,11 +139,13 @@ class DummyOpenVLAPolicy(BasePolicy):
                 )
 
         if self.phase == "move_above_bin":
+            self.move_above_bin_steps += 1
             bin_position = policy_input.bin_position or [0.0, 0.0, self.carry_height]
             xy_distance = math.sqrt(
                 (bin_position[0] - current_ee[0]) ** 2 + (bin_position[1] - current_ee[1]) ** 2
             )
-            if xy_distance > self.position_tolerance:
+            in_descent_stage = xy_distance <= self.position_tolerance
+            if not in_descent_stage:
                 # Stage 1: travel laterally at a fixed carry height so the
                 # held object never drags diagonally close to the table
                 # or bin.
@@ -141,10 +161,46 @@ class DummyOpenVLAPolicy(BasePolicy):
                 ]
 
             delta, distance = self._delta_to_target(current_ee, stage_target)
-            self.last_info = {"distance_to_target": distance, "target": stage_target}
-            if distance <= self.position_tolerance:
+            held = bool(robot_state.get("held_object", False))
+
+            # Normal path: tight tolerance on the current stage target.
+            reached_stage_target = distance <= self.position_tolerance
+            # Escape hatch 1: xy (horizontal distance to the bin) and z
+            # (vertical distance to the drop height) are checked
+            # separately rather than as one combined 3D distance, so a
+            # slightly-too-wide xy alone (still "near the bin") doesn't
+            # get stuck failing the combined check forever. The vertical
+            # leg is deliberately kept at position_tolerance, not looser:
+            # the backend's PLACE_THRESHOLD (0.08) only leaves ~0.03 of
+            # margin above PLACE_APPROACH_CLEARANCE (0.05) before a
+            # release actually misses the bin, and 0.03 is exactly
+            # position_tolerance -- loosening this leg would open the
+            # gripper too high and turn a "success" into a "released".
+            vertical_distance_to_drop = abs(current_ee[2] - (bin_position[2] + PLACE_APPROACH_CLEARANCE))
+            near_bin_force_open = (
+                held
+                and in_descent_stage
+                and xy_distance <= self.bin_open_distance_threshold
+                and vertical_distance_to_drop <= self.position_tolerance
+            )
+            # Escape hatch 2: unconditional time-box so this phase can
+            # never oscillate forever, even if still far from the bin.
+            exceeded_max_steps = held and self.move_above_bin_steps >= self.max_move_above_bin_steps
+
+            if reached_stage_target or near_bin_force_open or exceeded_max_steps:
+                if reached_stage_target:
+                    reason = None
+                elif near_bin_force_open:
+                    reason = "near_bin_force_open"
+                else:
+                    reason = "max_move_above_bin_steps_exceeded"
+
+                self.last_info = {"distance_to_target": distance, "target": stage_target}
+                if reason is not None:
+                    self.last_info["phase_transition_reason"] = reason
                 self.phase = "open_gripper"
             else:
+                self.last_info = {"distance_to_target": distance, "target": stage_target}
                 return PolicyOutput(
                     action=[delta[0], delta[1], delta[2], 0.0, 0.0, 0.0, 1.0],
                     phase="move_above_bin",

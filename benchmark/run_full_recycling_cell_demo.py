@@ -42,6 +42,7 @@ from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.onnx_yolo_detector import ONNXYOLODetector
 from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.policy_types import PolicyInput
+from real2sim.aruco_table_mapper import ArUcoTableMapper, draw_aruco_debug_image, print_aruco_mapping_debug
 from real2sim.calibrated_image_to_sim_mapper import (
     CalibratedImageToSimMapper,
     draw_roi_rectangle,
@@ -59,6 +60,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INSTRUCTION = "플라스틱 병을 플라스틱 수거함에 넣어줘"
 
 DEFAULT_CALIBRATION_CONFIG = "configs/real2sim_webcam_calibration.json"
+DEFAULT_ARUCO_CALIBRATION = "configs/real2sim_aruco_table_calibration.json"
 
 # The scripted policy issues one big move_end_effector_to() call per
 # action rather than small per-step deltas, so it doesn't hit the
@@ -86,7 +88,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-debug-image", action="store_true")
     parser.add_argument("--webcam-output-dir", type=str, default="results/webcam")
 
+    parser.add_argument("--real2sim-mode", choices=["roi", "aruco"], default="roi")
     parser.add_argument("--real2sim-calibration", type=str, default=DEFAULT_CALIBRATION_CONFIG)
+    parser.add_argument("--aruco-calibration", type=str, default=DEFAULT_ARUCO_CALIBRATION)
 
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument("--print-mapping-debug", dest="print_mapping_debug", action="store_true")
@@ -429,21 +433,61 @@ def main() -> None:
     print(f"{detection.label} (confidence={detection.confidence:.2f}) -> {sim_object_type}")
 
     image_height, image_width = task_frame.shape[:2]
-    sim_mapper = CalibratedImageToSimMapper.from_config_file(resolve(args.real2sim_calibration))
-    sim_position, mapping_debug = sim_mapper.map_bbox_to_sim(detection.bbox_xyxy, image_width, image_height)
-    print("=== Mapped Panda Sim Position ===")
-    print(sim_position)
-    print()
-    if args.print_mapping_debug:
-        print_mapping_debug(mapping_debug)
 
-    if args.save_debug_image:
-        frame_with_roi = draw_roi_rectangle(task_frame, mapping_debug["image_roi"])
-        debug_image = draw_debug_image(frame_with_roi, detection, sim_position, task_goal, f"policy={args.policy}")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_output_path = resolve(args.webcam_output_dir) / f"webcam_detection_debug_{timestamp}.jpg"
-        saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
-        print(f"Saved debug detection image to: {saved_debug_path}")
+    if args.real2sim_mode == "aruco":
+        try:
+            aruco_mapper = ArUcoTableMapper(resolve(args.aruco_calibration))
+        except (RuntimeError, FileNotFoundError, ValueError) as exc:
+            print(f"ArUco mapper setup failed: {exc}")
+            return
+
+        marker_detections = aruco_mapper.detect_markers(task_frame)
+        sim_position, mapping_debug = aruco_mapper.map_detection(detection, task_frame)
+        print("=== Mapped Panda Sim Position ===")
+        print(sim_position)
+        print()
+        if args.print_mapping_debug:
+            print_aruco_mapping_debug(mapping_debug)
+
+        if args.save_debug_image:
+            summary = f"policy={args.policy}"
+            if mapping_debug.get("out_of_bounds"):
+                summary += " (OUT OF BOUNDS)"
+            display_position = mapping_debug.get("mapped_position_raw", sim_position)
+            debug_image = draw_aruco_debug_image(
+                task_frame,
+                marker_detections,
+                aruco_mapper.required_marker_ids,
+                detection=detection,
+                mapped_position=display_position,
+                task_goal=task_goal,
+                summary=summary,
+                draw_table_polygon=aruco_mapper.debug_config.get("draw_table_polygon", True),
+            )
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_output_path = resolve(args.webcam_output_dir) / f"webcam_detection_debug_{timestamp}.jpg"
+            saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
+            print(f"Saved debug detection image to: {saved_debug_path}")
+
+        if sim_position is None:
+            print("FAIL")
+            return
+    else:
+        sim_mapper = CalibratedImageToSimMapper.from_config_file(resolve(args.real2sim_calibration))
+        sim_position, mapping_debug = sim_mapper.map_bbox_to_sim(detection.bbox_xyxy, image_width, image_height)
+        print("=== Mapped Panda Sim Position ===")
+        print(sim_position)
+        print()
+        if args.print_mapping_debug:
+            print_mapping_debug(mapping_debug)
+
+        if args.save_debug_image:
+            frame_with_roi = draw_roi_rectangle(task_frame, mapping_debug["image_roi"])
+            debug_image = draw_debug_image(frame_with_roi, detection, sim_position, task_goal, f"policy={args.policy}")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_output_path = resolve(args.webcam_output_dir) / f"webcam_detection_debug_{timestamp}.jpg"
+            saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
+            print(f"Saved debug detection image to: {saved_debug_path}")
 
     safety_gate = build_safety_gate(args, model_path)
     backend = PyBulletPandaBackend(gui=args.gui)

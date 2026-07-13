@@ -1,0 +1,38 @@
+{
+  "mapping_mode": "aruco_table_plane_homography",
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "required_marker_ids": [0, 1, 2, 3],
+    "min_required_markers": 4
+  },
+  "table_markers": {
+    "0": {
+      "name": "front_left",
+      "sim_xy": [0.55, -0.25]
+    },
+    "1": {
+      "name": "front_right",
+      "sim_xy": [0.55, 0.25]
+    },
+    "2": {
+      "name": "back_right",
+      "sim_xy": [0.25, 0.25]
+    },
+    "3": {
+      "name": "back_left",
+      "sim_xy": [0.25, -0.25]
+    }
+  },
+  "sim_workspace": {
+    "x_min": 0.25,
+    "x_max": 0.55,
+    "y_min": -0.25,
+    "y_max": 0.25,
+    "object_z": 0.05
+  },
+  "out_of_bounds_policy": "reject",
+  "debug": {
+    "draw_marker_axes": false,
+    "draw_table_polygon": true
+  }
+}
