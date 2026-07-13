@@ -22,11 +22,13 @@ hand's own frame (link 8).
 """
 
 import math
+import time
 
 import pybullet as p
 import pybullet_data
 
 from action_adapter.adapter_v0 import RobotCommand
+from robot_core.robot_backend import RobotBackend
 from robot_sim.backend_interface import SimulatorBackend
 
 GRASP_THRESHOLD = 0.05
@@ -57,7 +59,15 @@ def _evaluate_safety_result(result):
     return False, None
 
 
-class PyBulletPandaBackend(SimulatorBackend):
+class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
+    """Implements both the older, narrower SimulatorBackend
+    (reset/apply_command/get_state/close) and the newer RobotBackend
+    (adds move_end_effector_to/open_gripper/close_gripper/shutdown --
+    already de facto public methods here, now declared explicitly) --
+    see robot_core/robot_backend.py. Existing SimulatorBackend-typed
+    call sites keep working unchanged; shutdown() is a thin alias for
+    close() so RobotBackend-typed call sites (and a future
+    RealRobotBackend/ROS2RobotBackend swap) work too."""
     def __init__(self, gui: bool = True, time_step: float = 1.0 / 240.0):
         self.gui = gui
         self.time_step = time_step
@@ -152,17 +162,26 @@ class PyBulletPandaBackend(SimulatorBackend):
 
         return self.get_state()
 
-    def apply_command(self, command: RobotCommand, steps: int = DEFAULT_MOVE_STEPS) -> dict:
-        ee_position, ee_orientation = self._get_ee_pose()
+    def apply_command(
+        self, command: RobotCommand, steps: int = DEFAULT_MOVE_STEPS, step_delay: float = 0.0
+    ) -> dict:
+        ee_position, _ = self._get_ee_pose()
 
         target_position = [
             ee_position[0] + command.target_dx,
             ee_position[1] + command.target_dy,
             ee_position[2] + command.target_dz,
         ]
-        # v1: orientation deltas (target_droll/dpitch/dyaw) are ignored --
-        # keep the current end-effector orientation as-is.
-        self.move_end_effector_to(target_position, ee_orientation, steps=steps)
+        # v1: orientation deltas (target_droll/dpitch/dyaw) are ignored.
+        # Anchor to the fixed self.default_orientation (via
+        # target_orientation=None) rather than re-reading "current"
+        # orientation each call: numerical IK doesn't perfectly preserve
+        # orientation step to step, and an online control loop calling
+        # apply_command() many times in a row (unlike the few large
+        # single-shot moves in the scripted demos) lets that per-call
+        # error compound into a large drift that can stall further
+        # motion -- confirmed by reproducing it with ~30 repeated calls.
+        self.move_end_effector_to(target_position, steps=steps, step_delay=step_delay)
 
         if command.gripper_command == "open":
             self.open_gripper()
@@ -181,6 +200,7 @@ class PyBulletPandaBackend(SimulatorBackend):
         safety_check_interval: int = 10,
         trajectory_callback=None,
         trajectory_record_interval: int = 10,
+        step_delay: float = 0.0,
     ) -> dict:
         if target_orientation is None:
             target_orientation = self.default_orientation
@@ -207,6 +227,8 @@ class PyBulletPandaBackend(SimulatorBackend):
 
         for step_index in range(steps):
             p.stepSimulation(physicsClientId=self.client_id)
+            if step_delay > 0:
+                time.sleep(step_delay)
 
             if (
                 trajectory_callback is not None
@@ -390,6 +412,10 @@ class PyBulletPandaBackend(SimulatorBackend):
         if self.client_id is not None:
             p.disconnect(self.client_id)
             self.client_id = None
+
+    def shutdown(self) -> None:
+        """RobotBackend-interface alias for close() -- see class docstring."""
+        self.close()
 
     def print_joint_info(self) -> None:
         if self.robot_id is None:

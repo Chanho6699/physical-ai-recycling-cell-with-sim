@@ -80,6 +80,8 @@ Safety Pause/Resume은 VLA policy 바깥에서 동작합니다 -- policy는 매 
 
 `--hand-safety-source`가 실제 hand intrusion 신호의 출처를 결정합니다: `mock`(v0, `--mock-hand-start-step`/`--mock-hand-end-step` 구간을 손이 있는 것처럼 흉내)과 `external-camera`(v1, MediaPipe HandLandmarker로 실제 외부 카메라 frame에서 손을 검출)가 정확히 같은 pause/resume state machine과 episode/metadata 스키마를 공유합니다 -- `reason` 필드만 `"mock_hand_intrusion"` 대 `"hand_in_workspace"`로 다릅니다. `hand_intrusion_events`는 raw hand-in-workspace 감지 횟수(현재는 pause_count와 동일하게 집계), `hand_detector_backend`는 `external-camera`일 때만 `"mediapipe"`로 채워집니다. `--safety-mode off`(기본값)/`block`은 이 기능 이전과 동일하게 동작하고, `pause_count`/`resume_count`/`paused_steps`/`hand_intrusion_events`는 모두 0으로 남습니다.
 
+이 pause/resume state machine 자체는 `safety/safety_supervisor.py`의 `SafetySupervisor` 클래스가 소유합니다(Hardware-Portable Backend Abstraction v0 -- [docs/architecture.md](architecture.md#hardware-portable-backend-abstraction-v0), [docs/hardware_portability.md](hardware_portability.md) 참고). episode/metadata 스키마와 기록 동작은 전혀 바뀌지 않았습니다 -- 기존에 control loop 안에 inline되어 있던 상태 머신 로직을 그대로 별도 클래스로 옮긴 것뿐입니다.
+
 **아직 official LeRobot 포맷은 아닙니다** -- 여전히 이 프로젝트 고유의 JSONL/PNG 기반 raw 포맷이고, 이미지/비디오/parquet 공식 변환은 future work로 남아 있습니다 (5번 참고).
 
 ## 2. LeRobot 스타일 JSONL (LeRobotDatasetExporter)

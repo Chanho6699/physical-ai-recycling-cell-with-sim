@@ -8,6 +8,8 @@ source .venv/bin/activate
 
 GUI 창을 확인하고 싶으면 `--headless`를 빼고 `--gui`(기본값)로 실행하면 됩니다. 자동화/CI 환경에서는 `--headless`를 권장합니다.
 
+아래 모든 명령의 CLI 플래그는 Hardware-Portable Backend Abstraction v0(`create_robot_backend`/`create_policy_backend`/`create_external_camera_backend`/`create_hand_safety_monitor` -- [docs/architecture.md](architecture.md), [docs/hardware_portability.md](hardware_portability.md) 참고) 이후에도 전부 그대로 동작합니다 -- 이번 정리는 내부 구조 경계만 명확히 한 것이고 CLI/동작 변경은 없습니다.
+
 ## 1. Full demo
 
 전체 파이프라인(TaskGoal → 인식 → Real2Sim → policy → SafetyGate → 기록)을 한 번에 실행합니다.

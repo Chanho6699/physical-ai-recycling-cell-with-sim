@@ -1,12 +1,12 @@
 # Physical AI Recycling Cell
 
-> This project implements an end-to-end Physical AI recycling cell prototype that maps a natural-language instruction and an input image into a Panda robot pick-and-place action sequence in simulation.
+> This project is not just a PyBullet demo -- it is a hardware-portable Physical AI / VLA-ready software brain, currently validated end-to-end in simulation, that maps a natural-language instruction and camera input into a Panda robot pick-and-place action sequence.
 
-자연어 명령과 카메라 이미지 한 장을 입력받아, 시뮬레이션 환경에서 Franka Panda 로봇이 재활용 대상 물체를 인식하고 집어서 올바른 수거함에 넣는 전체 파이프라인을 구현한 개인 프로젝트입니다.
+자연어 명령과 카메라 이미지를 입력받아, 인식 → Real2Sim 좌표 변환 → policy → 로봇 제어 → 안전 점검(pause/resume 포함) → 데이터 기록까지 이어지는 recycling cell 파이프라인을 구현한 개인 프로젝트입니다. 현재는 PyBullet 시뮬레이션 위에서 전체 파이프라인을 검증하고 있지만, **핵심 목표는 시뮬레이션 데모가 아니라 실제 하드웨어 로봇팔에 이식 가능한 구조**입니다 -- 그래서 로봇/카메라/policy/safety를 모두 인터페이스 뒤에 두고, PyBulletPandaBackend/iVCam/dummy VLA/mock-hand-safety를 각각 실제 하드웨어 구현체로 교체할 수 있도록 경계를 정리했습니다(자세한 내용은 [docs/hardware_portability.md](docs/hardware_portability.md) 참고).
 
 ## 1. 한 줄 소개
 
-"플라스틱 병을 플라스틱 수거함에 넣어줘" 같은 한국어 명령과 이미지 한 장으로 시작해서, 인식 → 좌표 변환 → 로봇 제어 → 안전 점검 → 데이터 기록까지 이어지는 recycling cell 파이프라인을 PyBullet 시뮬레이션으로 구현하고 검증한 프로젝트입니다.
+"플라스틱 병을 플라스틱 수거함에 넣어줘" 같은 한국어 명령과 이미지 한 장으로 시작해서, 인식 → 좌표 변환 → 로봇 제어 → 안전 점검 → 데이터 기록까지 이어지는 recycling cell 파이프라인을 PyBullet 시뮬레이션으로 구현하고 검증했으며, 각 단계를 실제 하드웨어로 교체 가능한 인터페이스(RobotBackend/CameraBackend/PolicyBackend/SafetySupervisor) 뒤에 두도록 정리한 프로젝트입니다.
 
 ## 2. 문제 정의
 
@@ -63,13 +63,17 @@ Dataset Export / Replay Validation
 | YOLO/ONNX detection | ONNX Runtime 기반 YOLO로 이미지에서 재활용 대상 탐지 |
 | Target selection | 탐지 결과 중 TaskGoal의 target_object와 일치하는 대상 선택 |
 | Real2Sim mapping | 이미지 bbox 중심 좌표를 Panda workspace 3D 좌표로 변환 |
-| PyBulletPandaBackend | Franka Panda URDF, IK 기반 end-effector 이동, gripper open/close, grasp/place 판정, task_status 관리 |
+| PyBulletPandaBackend | Franka Panda URDF, IK 기반 end-effector 이동, gripper open/close, grasp/place 판정, task_status 관리 (`RobotBackend`/`SimulatorBackend` 인터페이스 구현) |
+| Wrist camera + grasp refinement | end-effector에 붙은 가상 eye-in-hand 카메라로 물체 위치를 근거리에서 재추정, grasp target 보정 |
+| VLA-ready per-step observation | 매 policy step마다 wrist camera RGB를 `PolicyInput.image`로 전달하는 online control loop |
+| PolicyBackend (local-dummy / fastapi-dummy) | `DummyOpenVLAPolicy`(in-process)와 `FastAPIVLAPolicyClient`(HTTP, `openvla_server_dummy/dummy_server.py`)가 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현 -- 실제 OpenVLA 서버로 교체 가능한 자리 |
 | SafetyGate | action 실행 전(및 이동 중) hazard 여부를 점검해서 차단 (mock / ONNX YOLO 모두 지원) |
-| TrajectoryRecorder | raw episode(JSON) + frame(PNG) 저장 |
+| Safety Pause/Resume + SafetySupervisor | hand 침입 시 로봇 action 적용을 일시정지하고, 손이 사라지면 종료 없이 이어서 진행 (mock-timed v0, 실제 외부 카메라 MediaPipe hand detector v1) |
+| CameraBackend / RobotBackend 추상화 | 외부 카메라(iVCam/webcam/정적 이미지)/로봇(PyBullet/향후 실제 하드웨어)을 인터페이스 뒤에 두어 하드웨어 이식 경로를 명확히 함 |
+| TrajectoryRecorder + perception-to-action episode metadata | raw episode(JSON) + frame(PNG) + 인식/매핑/safety 전체 체인 기록 |
 | LeRobot 스타일 dataset exporter | raw episode를 image/state/instruction/action 중심 JSONL로 변환 |
 | Dataset replay validator | 저장된 action이 PyBullet Panda에서 물리적으로 재현되는지 검증 |
 | OpenVLA 스타일 action adapter | dataset action ↔ `[dx, dy, dz, droll, dpitch, dyaw, gripper]` 7-DoF 변환 검증 |
-| DummyOpenVLAPolicy | 실제 모델 없이 phase 기반으로 동작하는 online control loop policy |
 | Full demo runner | 위 전체 흐름을 하나의 진입점으로 실행 (`benchmark/run_full_recycling_cell_demo.py`) |
 
 ## 6. 대표 실행 명령
@@ -115,7 +119,8 @@ python -m benchmark.run_full_recycling_cell_demo \
 - **dummy-openvla**: 실제 OpenVLA 없이 rule-based phase state machine으로 동작하는 scripted oracle policy(`DummyOpenVLAPolicy`)입니다. `PolicyInput → predict_action() → 7-DoF action → ActionAdapter → RobotCommand`라는, 실제 정책을 나중에 그대로 꽂아 넣을 수 있는 online control loop 구조를 검증하기 위한 것입니다.
   - phase: `move_to_object → close_gripper → lift_object → move_above_bin → open_gripper → done`
   - 기본 실행/기록 실행/mock hazard 시나리오 모두 PASS로 검증했습니다.
-- **future**: 위 두 policy와 동일한 `BasePolicy` 인터페이스를 구현하는 실제 OpenVLA 클라이언트(또는 FastAPI dummy server 클라이언트)로 교체 가능하도록 설계했습니다. 아직 구현하지 않았습니다.
+- **fastapi-dummy** (`--policy-backend fastapi-dummy`, `policy/fastapi_vla_policy_client.py::FastAPIVLAPolicyClient`): `DummyOpenVLAPolicy`를 그대로 호스팅하는 FastAPI 서버(`openvla_server_dummy/dummy_server.py`)에 HTTP로 요청하는 클라이언트입니다. `local-dummy`와 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하므로 control loop는 어느 backend인지 신경 쓰지 않고, 실제로 같은 `policy_steps`로 끝납니다(같은 phase 엔진을 실행하기 때문).
+- **future**: 위 policy들과 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하는 실제 OpenVLA 클라이언트로 교체 가능하도록 설계했습니다. 아직 구현하지 않았습니다.
 
 ## 8. dataset / replay 검증
 
@@ -134,29 +139,33 @@ python -m benchmark.run_full_recycling_cell_demo \
   - `onnx`: ONNX Runtime YOLO 기반으로 실제 이미지에서 person 등 hazard를 탐지
 - hazard가 감지되면 로봇 동작이 즉시 차단되고 `task_status=blocked_by_safety`로 종료됩니다.
 - 별도 데모(`run_task_goal_real2sim_panda_interrupt_demo.py`)에서는 이동 도중(mid-motion)에도 주기적으로 안전 점검을 수행해서 중간에 정지시키는 구조(Layer 2)까지 검증했습니다.
+- **Safety Pause/Resume** (`--safety-mode pause-resume`): 위 hard-block 경로와 별개로, hand 침입이 감지되면 로봇 action 적용만 멈추고(policy 자체를 호출하지 않음) episode를 종료하지 않습니다. 손이 사라져도 `--safety-resume-stable-steps`번 연속 clear를 확인한 뒤에야 같은 episode/policy phase를 이어서 진행합니다. `--hand-safety-source mock`(시간 기반 mock-timed, v0)과 `--hand-safety-source external-camera`(MediaPipe HandLandmarker로 실제 외부 카메라 frame에서 hand/arm 침입을 검출, ArUco workspace polygon 안에 들어올 때만 pause, v1) 모두 `safety/safety_supervisor.py`의 동일한 `SafetySupervisor` 상태 머신을 공유합니다. 이 상태 머신은 VLA policy 바깥에 있습니다: policy는 action을 제안할 뿐이고, 실제 적용 여부는 SafetySupervisor가 결정합니다.
 
 ## 10. 현재 하지 않은 것
 
 이 프로젝트는 아직 다음을 포함하지 않습니다. 과장하지 않기 위해 명확히 남겨둡니다.
 
-- 실제 OpenVLA 모델은 아직 연결하지 않았습니다. `DummyOpenVLAPolicy`는 이름과 달리 모델이 아니라 rule-based scripted policy입니다.
+- 실제 OpenVLA 모델은 아직 연결하지 않았습니다. `DummyOpenVLAPolicy`는 이름과 달리 모델이 아니라 rule-based scripted policy이고, FastAPI 서버(`openvla_server_dummy/`)도 이 `DummyOpenVLAPolicy`를 그대로 호스팅할 뿐 실제 VLA 모델이 아닙니다.
 - OpenVLA fine-tuning은 아직 수행하지 않았습니다.
 - LeRobot 공식 parquet/video 포맷 변환은 아직 수행하지 않았습니다. 현재 dataset exporter는 JSONL 기반의 "LeRobot 스타일" 로컬 포맷입니다.
-- Isaac Sim, ROS 2, TensorRT는 이번 runner에는 포함되지 않습니다. (Isaac Sim 검토 배경은 [docs/00_project_goal.md](docs/00_project_goal.md), [docs/03_architecture.md](docs/03_architecture.md) 참고)
-- FastAPI 기반 dummy OpenVLA 서버(`openvla_server_dummy/`)는 프로젝트 초기 단계에서 구조 검증용으로 만들었지만, 현재 `run_full_recycling_cell_demo.py` 흐름에는 연결되어 있지 않습니다.
-- 실제 로봇 하드웨어 연동은 다루지 않습니다. 모든 실행은 PyBullet 시뮬레이션 안에서만 이루어집니다.
+- LLM Agent 기반 multi-step planning은 아직 없습니다. `RuleBasedTaskGoalParser`는 rule-based 단일 명령 파서입니다.
+- ROS2 실제 제어는 아직 없습니다. `robot_core/ros2_robot_backend.py`/`vision/camera_backend.py`의 `ROS2CameraBackend`는 인터페이스 skeleton일 뿐, 모든 메서드가 `NotImplementedError`를 던집니다.
+- Isaac Sim, TensorRT는 이번 runner에는 포함되지 않습니다. (Isaac Sim 검토 배경은 [docs/00_project_goal.md](docs/00_project_goal.md), [docs/03_architecture.md](docs/03_architecture.md) 참고)
+- 실제 로봇 하드웨어 연동은 다루지 않습니다. `robot_core/real_robot_backend.py`의 `RealRobotBackend`도 인터페이스 skeleton일 뿐이고, 모든 실행은 PyBullet 시뮬레이션 안에서만 이루어집니다.
 
 ## 11. 다음 확장 계획
 
-- `BasePolicy` 인터페이스를 유지한 채 `DummyOpenVLAPolicy`를 FastAPI dummy OpenVLA server 클라이언트로 교체 (`docs/architecture.md`의 "다음 단계" 참고)
-- 이후 실제 OpenVLA 모델을 서빙하는 policy 어댑터로 교체
+- `RealRobotBackend`/`ROS2RobotBackend` skeleton을 실제 하드웨어 제어 코드로 채우기
+- 실제 OpenVLA 모델을 서빙하는 `PolicyBackend` 어댑터로 교체 (지금의 `FastAPIVLAPolicyClient`와 같은 `/predict` 계약을 실제 모델이 채우면 됨)
 - LeRobot 공식 parquet/video 포맷 변환 지원
-- ROS 2 node/topic 구조로 리팩토링
+- LLM Agent 기반 multi-step task planning
+- wrist camera 기반 hand safety + 외부 카메라와의 fusion
 - 고사양 GPU 또는 클라우드 환경에서 Isaac Sim backend 검증
 
 ## 문서
 
 - [docs/architecture.md](docs/architecture.md) — 현재 아키텍처와 구성 요소별 역할
+- [docs/hardware_portability.md](docs/hardware_portability.md) — 하드웨어 이식 시 무엇을 교체해야 하는지 정리한 manifest
 - [docs/demo_commands.md](docs/demo_commands.md) — 실행 명령 모음
 - [docs/dataset_pipeline.md](docs/dataset_pipeline.md) — dataset 기록/변환/검증 흐름
 - [docs/](docs/) — 개발 단계별 기록(00~07)과 그 이후 진행 상황
