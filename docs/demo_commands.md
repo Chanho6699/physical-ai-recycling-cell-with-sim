@@ -117,3 +117,17 @@ python -m benchmark.replay_openvla_action_adapter_demo \
 ```
 
 기대 결과: `replay_success_rate=1.00`.
+
+## 9. Real2Sim mapping calibration probe
+
+PyBullet을 켜지 않고 detection → Real2Sim mapping만 빠르게 확인합니다. `configs/real2sim_webcam_calibration.json`의 `image_roi`/`axis_mapping`/`sim_workspace`를 튜닝할 때, 매번 pick-and-place 전체를 실행하지 않고 이 probe로 `mapped_position`이 원하는 대로 나오는지 먼저 확인하는 용도입니다.
+
+```bash
+python -m benchmark.probe_real2sim_mapping \
+  --image-source webcam \
+  --camera-url http://172.17.32.1:5050/video \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --save-debug-image
+```
+
+`--image-path`, `--camera-index`, `--real2sim-calibration`(기본 `configs/real2sim_webcam_calibration.json`)도 `run_full_recycling_cell_demo.py`와 동일하게 지원합니다. 출력의 `=== Real2Sim Mapping Debug ===` 블록(`bbox_center`, `bbox_size`, `normalized_center`, `clamped`, `mapped_position` 등)으로 같은 물체를 카메라에서 가깝게/멀게/좌우로 옮겼을 때 `mapped_position`이 실제로 달라지는지 비교하세요. `--save-debug-image`를 주면 detection bbox뿐 아니라 calibration ROI 사각형도 함께 그려서 저장합니다.

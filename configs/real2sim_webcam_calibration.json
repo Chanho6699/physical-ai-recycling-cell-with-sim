@@ -1,0 +1,23 @@
+{
+  "mapping_mode": "roi_linear_table_plane",
+  "image_roi": {
+    "x_min": 0,
+    "x_max": 640,
+    "y_min": 120,
+    "y_max": 480
+  },
+  "sim_workspace": {
+    "x_min": 0.25,
+    "x_max": 0.55,
+    "y_min": -0.25,
+    "y_max": 0.25,
+    "object_z": 0.05
+  },
+  "axis_mapping": {
+    "image_x_to_sim_y": true,
+    "image_y_to_sim_x": true,
+    "invert_image_x": false,
+    "invert_image_y": false
+  },
+  "clamp_to_roi": true
+}

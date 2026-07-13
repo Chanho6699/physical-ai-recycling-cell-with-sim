@@ -42,7 +42,11 @@ from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.onnx_yolo_detector import ONNXYOLODetector
 from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.policy_types import PolicyInput
-from real2sim.image_to_sim_mapper import ImageToSimMapper
+from real2sim.calibrated_image_to_sim_mapper import (
+    CalibratedImageToSimMapper,
+    draw_roi_rectangle,
+    print_mapping_debug,
+)
 from real2sim.recyclable_object_mapper import RecyclableObjectMapper
 from robot_sim.camera_utils import save_rgb_image
 from robot_sim.pybullet_panda_backend import PyBulletPandaBackend
@@ -54,11 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_INSTRUCTION = "플라스틱 병을 플라스틱 수거함에 넣어줘"
 
-# Panda-specific Real2Sim workspace ranges (see
-# run_task_goal_real2sim_panda_demo.py).
-SIM_X_RANGE = (0.25, 0.55)
-SIM_Y_RANGE = (-0.25, 0.25)
-OBJECT_Z = 0.05
+DEFAULT_CALIBRATION_CONFIG = "configs/real2sim_webcam_calibration.json"
 
 # The scripted policy issues one big move_end_effector_to() call per
 # action rather than small per-step deltas, so it doesn't hit the
@@ -86,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-debug-image", action="store_true")
     parser.add_argument("--webcam-output-dir", type=str, default="results/webcam")
 
+    parser.add_argument("--real2sim-calibration", type=str, default=DEFAULT_CALIBRATION_CONFIG)
+
+    debug_group = parser.add_mutually_exclusive_group()
+    debug_group.add_argument("--print-mapping-debug", dest="print_mapping_debug", action="store_true")
+    debug_group.add_argument("--no-print-mapping-debug", dest="print_mapping_debug", action="store_false")
+    parser.set_defaults(print_mapping_debug=True)
+
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
     parser.add_argument("--safety-monitor", choices=["none", "mock", "onnx"], default="none")
@@ -107,7 +114,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--carry-height", type=float, default=0.18)
     parser.add_argument("--grasp-z-offset", type=float, default=0.015)
 
+    parser.add_argument("--policy-step-delay", type=float, default=0.0)
+    parser.add_argument("--simulation-step-delay", type=float, default=0.0)
+    parser.add_argument("--slow-gui", action="store_true")
+
     return parser.parse_args()
+
+
+# --slow-gui preset (only meaningful with --gui): slow enough for a
+# person to actually follow the arm's motion without changing headless
+# speed at all, since both delays stay 0.0 unless --gui slow mode (this
+# preset or an explicit --policy-step-delay/--simulation-step-delay) asks
+# for them.
+SLOW_GUI_POLICY_STEP_DELAY = 0.05
+SLOW_GUI_SIMULATION_STEP_DELAY = 0.003
+
+
+def resolve_step_delays(args) -> tuple:
+    """A value >0 on the explicit CLI flags always wins; --slow-gui only
+    fills in its preset where the explicit flag was left at its 0.0
+    default."""
+    policy_step_delay = args.policy_step_delay if args.policy_step_delay > 0 else (
+        SLOW_GUI_POLICY_STEP_DELAY if args.slow_gui else 0.0
+    )
+    simulation_step_delay = args.simulation_step_delay if args.simulation_step_delay > 0 else (
+        SLOW_GUI_SIMULATION_STEP_DELAY if args.slow_gui else 0.0
+    )
+    return policy_step_delay, simulation_step_delay
 
 
 def resolve(path_str: str) -> Path:
@@ -165,13 +198,23 @@ def blocked_state(state: dict, action_name: str, reason: str) -> dict:
     return final_state
 
 
-def run_scripted_policy(args, backend, safety_gate, recorder, task_frame, sim_position, bin_position):
+def run_scripted_policy(
+    args,
+    backend,
+    safety_gate,
+    recorder,
+    task_frame,
+    sim_position,
+    bin_position,
+    policy_step_delay: float = 0.0,
+    simulation_step_delay: float = 0.0,
+):
     bin_target = [bin_position[0], bin_position[1], bin_position[2] + SCRIPTED_BIN_APPROACH_CLEARANCE]
 
     actions = [
-        ("move_to_object", lambda: backend.move_end_effector_to(sim_position)),
+        ("move_to_object", lambda: backend.move_end_effector_to(sim_position, step_delay=simulation_step_delay)),
         ("close_gripper", lambda: backend.close_gripper()),
-        ("move_above_bin", lambda: backend.move_end_effector_to(bin_target)),
+        ("move_above_bin", lambda: backend.move_end_effector_to(bin_target, step_delay=simulation_step_delay)),
         ("open_gripper", lambda: backend.open_gripper()),
     ]
 
@@ -212,10 +255,24 @@ def run_scripted_policy(args, backend, safety_gate, recorder, task_frame, sim_po
                 image=task_frame if args.record_images else None,
             )
 
+        if policy_step_delay > 0:
+            time.sleep(policy_step_delay)
+
     return state, policy_steps
 
 
-def run_dummy_openvla_policy(args, backend, safety_gate, recorder, task_frame, task_goal, sim_position, bin_position):
+def run_dummy_openvla_policy(
+    args,
+    backend,
+    safety_gate,
+    recorder,
+    task_frame,
+    task_goal,
+    sim_position,
+    bin_position,
+    policy_step_delay: float = 0.0,
+    simulation_step_delay: float = 0.0,
+):
     action_adapter = ActionAdapter()
     policy = DummyOpenVLAPolicy(
         max_step_size=args.max_step_size,
@@ -262,7 +319,7 @@ def run_dummy_openvla_policy(args, backend, safety_gate, recorder, task_frame, t
                     )
                 return final_state, step_index + 1
 
-        state = backend.apply_command(robot_command, steps=args.steps_per_action)
+        state = backend.apply_command(robot_command, steps=args.steps_per_action, step_delay=simulation_step_delay)
 
         distance_to_target = (policy_output.info or {}).get("distance_to_target")
         dist_str = f"{distance_to_target:.3f}" if distance_to_target is not None else "n/a"
@@ -284,6 +341,9 @@ def run_dummy_openvla_policy(args, backend, safety_gate, recorder, task_frame, t
                 image=task_frame if args.record_images else None,
             )
 
+        if policy_step_delay > 0:
+            time.sleep(policy_step_delay)
+
         if state["task_status"] == "success" or policy_output.done:
             return state, step_index + 1
 
@@ -293,10 +353,16 @@ def run_dummy_openvla_policy(args, backend, safety_gate, recorder, task_frame, t
 def main() -> None:
     args = parse_args()
 
+    policy_step_delay, simulation_step_delay = resolve_step_delays(args)
+
     print("=== Full Recycling Cell Demo ===")
     print(f"policy: {args.policy}")
     print(f"safety_monitor: {args.safety_monitor}")
     print(f"record: {args.record}")
+    print(f"gui: {args.gui}")
+    print(f"slow_gui: {args.slow_gui}")
+    print(f"policy_step_delay: {policy_step_delay}")
+    print(f"simulation_step_delay: {simulation_step_delay}")
 
     task_goal_parser = RuleBasedTaskGoalParser()
     task_goal = task_goal_parser.parse(args.instruction)
@@ -363,20 +429,17 @@ def main() -> None:
     print(f"{detection.label} (confidence={detection.confidence:.2f}) -> {sim_object_type}")
 
     image_height, image_width = task_frame.shape[:2]
-    sim_mapper = ImageToSimMapper(
-        image_width=image_width,
-        image_height=image_height,
-        sim_x_range=SIM_X_RANGE,
-        sim_y_range=SIM_Y_RANGE,
-        object_z=OBJECT_Z,
-    )
-    center_x, center_y = detection.center_xy
-    sim_position = sim_mapper.image_point_to_sim_position(center_x, center_y)
+    sim_mapper = CalibratedImageToSimMapper.from_config_file(resolve(args.real2sim_calibration))
+    sim_position, mapping_debug = sim_mapper.map_bbox_to_sim(detection.bbox_xyxy, image_width, image_height)
     print("=== Mapped Panda Sim Position ===")
     print(sim_position)
+    print()
+    if args.print_mapping_debug:
+        print_mapping_debug(mapping_debug)
 
     if args.save_debug_image:
-        debug_image = draw_debug_image(task_frame, detection, sim_position, task_goal, f"policy={args.policy}")
+        frame_with_roi = draw_roi_rectangle(task_frame, mapping_debug["image_roi"])
+        debug_image = draw_debug_image(frame_with_roi, detection, sim_position, task_goal, f"policy={args.policy}")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         debug_output_path = resolve(args.webcam_output_dir) / f"webcam_detection_debug_{timestamp}.jpg"
         saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
@@ -427,11 +490,28 @@ def main() -> None:
         print("\n=== Policy Execution ===")
         if args.policy == "scripted":
             final_state, policy_steps = run_scripted_policy(
-                args, backend, safety_gate, recorder, task_frame, sim_position, bin_position
+                args,
+                backend,
+                safety_gate,
+                recorder,
+                task_frame,
+                sim_position,
+                bin_position,
+                policy_step_delay=policy_step_delay,
+                simulation_step_delay=simulation_step_delay,
             )
         else:
             final_state, policy_steps = run_dummy_openvla_policy(
-                args, backend, safety_gate, recorder, task_frame, task_goal, sim_position, bin_position
+                args,
+                backend,
+                safety_gate,
+                recorder,
+                task_frame,
+                task_goal,
+                sim_position,
+                bin_position,
+                policy_step_delay=policy_step_delay,
+                simulation_step_delay=simulation_step_delay,
             )
 
         print("\n=== Final State ===")
