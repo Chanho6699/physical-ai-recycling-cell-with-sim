@@ -29,12 +29,14 @@ import argparse
 import math
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from action_adapter.adapter_v0 import ActionAdapter
+from benchmark.run_task_goal_real2sim_panda_interrupt_demo import draw_debug_image
 from data_collection.trajectory_recorder import TrajectoryRecorder
 from llm_agent.rule_based_parser import RuleBasedTaskGoalParser
 from perception.onnx_yolo_detector import ONNXYOLODetector
@@ -42,9 +44,11 @@ from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.policy_types import PolicyInput
 from real2sim.image_to_sim_mapper import ImageToSimMapper
 from real2sim.recyclable_object_mapper import RecyclableObjectMapper
+from robot_sim.camera_utils import save_rgb_image
 from robot_sim.pybullet_panda_backend import PyBulletPandaBackend
 from safety.mock_safety_monitor import MockSafetyMonitor
 from safety.safety_gate import SafetyGate
+from vision.webcam_source import WebcamSource
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,9 +74,17 @@ KEEP_SECONDS = 30
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
-    parser.add_argument("--image-path", type=str, required=True)
     parser.add_argument("--model-path", type=str, default="weights/yolo26n.onnx")
     parser.add_argument("--confidence-threshold", type=float, default=0.25)
+
+    parser.add_argument("--image-source", choices=["image", "webcam"], default="image")
+    parser.add_argument("--image-path", type=str, default=None)
+    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-url", type=str, default=None)
+    parser.add_argument("--webcam-warmup-frames", type=int, default=10)
+    parser.add_argument("--save-webcam-frame", action="store_true")
+    parser.add_argument("--save-debug-image", action="store_true")
+    parser.add_argument("--webcam-output-dir", type=str, default="results/webcam")
 
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
@@ -115,6 +127,33 @@ def build_safety_gate(args, model_path: Path):
     from safety.onnx_yolo_safety_monitor import ONNXRuntimeYOLOSafetyMonitor
 
     return SafetyGate(ONNXRuntimeYOLOSafetyMonitor(model_path=str(model_path)))
+
+
+def load_webcam_frame(args):
+    """Open the webcam (or camera_url relay stream, which takes priority
+    when set), warm it up, and grab one frame. Returns None (with a
+    printed explanation) instead of raising if the camera can't be
+    opened or read -- WSL in particular often doesn't expose a webcam
+    device at all, and that shouldn't crash the whole demo with a
+    traceback.
+    """
+    try:
+        source = WebcamSource(camera_index=args.camera_index, camera_url=args.camera_url)
+    except RuntimeError:
+        if not args.camera_url:
+            print(f"Try a different --camera-index (currently {args.camera_index}, e.g. 0 or 1).")
+        return None
+
+    try:
+        source.warmup(args.webcam_warmup_frames)
+        return source.get_frame()
+    except RuntimeError as exc:
+        print(f"Failed to read frame from webcam: {exc}")
+        if not args.camera_url:
+            print(f"Try a different --camera-index (currently {args.camera_index}, e.g. 0 or 1).")
+        return None
+    finally:
+        source.close()
 
 
 def blocked_state(state: dict, action_name: str, reason: str) -> dict:
@@ -270,19 +309,36 @@ def main() -> None:
     print("=== TaskGoal ===")
     print(task_goal)
 
-    image_path = Path(args.image_path)
-    if not image_path.exists():
-        print(f"Image file not found: {image_path}")
-        print("Check --image-path and try again.")
-        return
-
     model_path = resolve(args.model_path)
     if not model_path.exists():
         print(f"ONNX model not found: {model_path}")
         print("Run tools/export_yolo_to_onnx.py first to create it.")
         return
 
-    task_frame = np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    if args.image_source == "image":
+        if not args.image_path:
+            print("--image-path is required when --image-source image")
+            return
+
+        image_path = Path(args.image_path)
+        if not image_path.exists():
+            print(f"Image file not found: {image_path}")
+            print("Check --image-path and try again.")
+            return
+
+        task_frame = np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    else:
+        task_frame = load_webcam_frame(args)
+        if task_frame is None:
+            print("FAIL")
+            return
+
+        if args.save_webcam_frame:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = resolve(args.webcam_output_dir) / f"webcam_frame_{timestamp}.jpg"
+            saved_path = save_rgb_image(task_frame, str(output_path))
+            print(f"Saved webcam frame to: {saved_path}")
+
     print(f"frame shape: {task_frame.shape}")
     print(f"frame dtype: {task_frame.dtype}")
 
@@ -318,6 +374,13 @@ def main() -> None:
     sim_position = sim_mapper.image_point_to_sim_position(center_x, center_y)
     print("=== Mapped Panda Sim Position ===")
     print(sim_position)
+
+    if args.save_debug_image:
+        debug_image = draw_debug_image(task_frame, detection, sim_position, task_goal, f"policy={args.policy}")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_output_path = resolve(args.webcam_output_dir) / f"webcam_detection_debug_{timestamp}.jpg"
+        saved_debug_path = save_rgb_image(debug_image, str(debug_output_path))
+        print(f"Saved debug detection image to: {saved_debug_path}")
 
     safety_gate = build_safety_gate(args, model_path)
     backend = PyBulletPandaBackend(gui=args.gui)
