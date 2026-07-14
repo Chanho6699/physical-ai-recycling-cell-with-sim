@@ -533,6 +533,53 @@ python -m benchmark.probe_real_vla_policy_client \
 
 `real_vla_request_failed: True`, `fallback_used: True`, `fallback_backend: local-dummy`, `action_len: 7`, **PASS**로 끝납니다 -- 서버 없이도 개발을 계속할 수 있습니다. `--real-vla-fallback-backend none`으로 fallback을 끄면, traceback 대신 사람이 읽을 수 있는 `RuntimeError` 메시지와 함께 `FAIL`로 끝납니다.
 
+## 27. Colab VLA Server Spike 확인 (v0)
+
+로컬 머신에 GPU가 없어도, Google Colab의 무료 GPU 런타임에 VLA 서버를 띄우고 로컬 `RealVLAPolicyClient`가 그 서버를 호출하도록 연결하는 spike입니다. 자세한 배경/한계는 [docs/colab_vla_server_spike.md](colab_vla_server_spike.md)를 참고하세요.
+
+**1. Colab에서 notebook 실행**: `notebooks/colab_vla_server_spike_v0.ipynb`을 Colab에 업로드(또는 `File > Open notebook > GitHub`)해서 순서대로 실행합니다. `SERVER_MODE = "mock-action"`으로 시작하세요. 마지막 셀이 public URL(`https://xxxx.ngrok-free.app` 또는 cloudflared의 `https://xxxx.trycloudflare.com`)을 출력합니다.
+
+**2. 로컬에서 config 업데이트**:
+
+```bash
+python scripts/update_colab_vla_config.py \
+  --base-url https://xxxx.ngrok-free.app \
+  --config configs/real_vla_backend_colab_config.json
+```
+
+기대 결과: `server_url`/`health_url`이 갱신되어 출력되고 `PASS`. `http(s)://` 스킴이 없거나 host가 없는 URL은 명확한 에러와 함께 `FAIL`.
+
+**3. 로컬 probe**:
+
+```bash
+python -m benchmark.probe_colab_vla_server \
+  --real-vla-config configs/real_vla_backend_colab_config.json \
+  --with-image
+```
+
+기대 결과(`mock-action` 모드): `health: ok`, `server_mode: mock-action`, `model_status: not_loaded`, `action_len: 7`, `fallback_used: False`, `PASS`. Colab 세션이 이미 끊겼다면: `fallback_used: True`, `PASS` 또는 `PASS (environment-confirmed limitation)`로 여전히 끝납니다(로컬 fallback이 동작하는 한 실패가 아닙니다).
+
+**4. 로컬 full demo**:
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --policy-backend real-vla \
+  --real-vla-config configs/real_vla_backend_colab_config.json \
+  --real-vla-fallback-backend local-dummy \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-path data/test_images/recyclable_scene.jpg \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --record \
+  --record-perception-metadata \
+  --record-policy-observations \
+  --headless
+```
+
+기대 결과: `policy_backend: real-vla`, `model: colab-mock-action`(mock-action 모드일 때), `final_status: success`, `PASS` -- Colab 서버가 꺼져 있어도 `--real-vla-fallback-backend local-dummy` 덕분에 여전히 `PASS`로 끝나야 합니다.
+
 ## Deprecated: 구식 `/predict_action` 데모
 
 `openvla_client/client_test.py`, `benchmark/run_pybullet_backend_pipeline.py`, `benchmark/run_task_pipeline.py`, `benchmark/run_dummy_pipeline.py`, `benchmark/run_robot_dummy_pipeline.py`, `benchmark/run_robot_backend_pipeline.py`는 `openvla_server_dummy/dummy_server.py`가 `/predict`, `/health`, `/reset`으로 정리되기 전의 구식 `/predict_action` endpoint를 사용하는 초기 단계 데모라 지금의 서버와 호환되지 않습니다. 각 파일 상단에 deprecated 주석을 남겨뒀고, 이 문서의 권장 경로에는 포함하지 않습니다 -- 대신 21~23번(FastAPI dummy VLA policy backend) 또는 `run_full_recycling_cell_demo.py --policy-backend fastapi-dummy`를 사용하세요.

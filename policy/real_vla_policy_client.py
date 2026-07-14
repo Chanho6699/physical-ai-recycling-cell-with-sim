@@ -110,6 +110,24 @@ class RealVLAPolicyClient(BasePolicy):
             payload["bin_position"] = policy_input.bin_position
         return payload
 
+    @staticmethod
+    def _describe_http_error(response, exc: Exception) -> str:
+        """Servers in this repo (real_vla_compatible_server.py,
+        colab_vla_server.py) return a structured {"error": ..., "reason":
+        ...} JSON body (e.g. model_not_loaded, action_adapter_required)
+        on failure -- surface that instead of just the raw HTTPError text
+        when it's present, so fallback_reason/logs actually explain what
+        happened instead of a generic "503 Service Unavailable"."""
+        try:
+            detail = response.json().get("detail")
+        except ValueError:
+            detail = None
+
+        if isinstance(detail, dict) and "error" in detail:
+            reason_text = detail.get("reason")
+            return f"{detail['error']}" + (f": {reason_text}" if reason_text else "")
+        return f"http_error_{response.status_code}: {exc}"
+
     def _fallback(self, policy_input: PolicyInput, reason: str) -> PolicyOutput:
         if self.fallback_policy is None:
             raise RuntimeError(
@@ -147,7 +165,7 @@ class RealVLAPolicyClient(BasePolicy):
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as exc:
-            return self._fallback(policy_input, f"http_error_{response.status_code}: {exc}")
+            return self._fallback(policy_input, self._describe_http_error(response, exc))
 
         try:
             data = response.json()

@@ -121,7 +121,8 @@ python -m benchmark.run_full_recycling_cell_demo \
   - 기본 실행/기록 실행/mock hazard 시나리오 모두 PASS로 검증했습니다.
 - **fastapi-dummy** (`--policy-backend fastapi-dummy`, `policy/fastapi_vla_policy_client.py::FastAPIVLAPolicyClient`): `DummyOpenVLAPolicy`를 그대로 호스팅하는 FastAPI 서버(`openvla_server_dummy/dummy_server.py`)에 HTTP로 요청하는 클라이언트입니다. `local-dummy`와 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하므로 control loop는 어느 backend인지 신경 쓰지 않고, 실제로 같은 `policy_steps`로 끝납니다(같은 phase 엔진을 실행하기 때문).
 - **real-vla** (`--policy-backend real-vla`, `policy/real_vla_policy_client.py::RealVLAPolicyClient`): 실제 OpenVLA/VLA 모델 서버가 들어올 수 있는 adapter 계층입니다. 서버 주소/이미지 인코딩/action clipping을 `configs/real_vla_backend_config.json`에서 읽고, VLA 응답 action은 항상 `policy/vla_action_postprocessor.py`로 검증/후처리한 뒤에만 적용됩니다. 서버 연결 실패 시 `--real-vla-fallback-backend`(기본 `local-dummy`)로 자동 전환합니다. 로컬 GPU/VRAM 부담을 피하기 위해 이번 v0은 실제 대형 모델을 로딩하지 않고, adapter-test mock 서버(`openvla_server_dummy/real_vla_compatible_server.py`, 내부적으로 `DummyOpenVLAPolicy` 재사용)로 스키마를 검증했습니다.
-- **future**: 위 policy들과 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하는 실제 OpenVLA 모델로 `real_vla_compatible_server.py`의 내부를 교체. 아직 구현하지 않았습니다.
+  - **Colab VLA Server Spike**: 로컬 머신에 GPU가 없어도 실제 OpenVLA 로딩을 시도해볼 수 있도록, Google Colab GPU 런타임에 같은 adapter 스키마를 쓰는 임시 서버(`openvla_server_real/colab_vla_server.py`, `notebooks/colab_vla_server_spike_v0.ipynb`)를 ngrok/cloudflared tunnel로 연결하는 spike를 추가했습니다. Colab 서버는 action proposal만 반환할 뿐 로봇을 직접 실행하지 않으며, 세션이 끊겨도 로컬 fallback이 그대로 동작합니다. 자세한 내용은 [docs/colab_vla_server_spike.md](docs/colab_vla_server_spike.md) 참고.
+- **future**: 위 policy들과 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하는 실제 OpenVLA 모델로 서버 내부를 교체. 아직 구현하지 않았습니다(Colab spike로 GPU 확보 경로만 검증).
 
 ## 8. dataset / replay 검증
 
@@ -167,6 +168,7 @@ python -m benchmark.run_full_recycling_cell_demo \
 
 - [docs/architecture.md](docs/architecture.md) — 현재 아키텍처와 구성 요소별 역할
 - [docs/hardware_portability.md](docs/hardware_portability.md) — 하드웨어 이식 시 무엇을 교체해야 하는지 정리한 manifest
+- [docs/colab_vla_server_spike.md](docs/colab_vla_server_spike.md) — Google Colab GPU에 임시 VLA 서버를 띄우고 로컬과 연결하는 spike
 - [docs/demo_commands.md](docs/demo_commands.md) — 실행 명령 모음
 - [docs/dataset_pipeline.md](docs/dataset_pipeline.md) — dataset 기록/변환/검증 흐름
 - [docs/](docs/) — 개발 단계별 기록(00~07)과 그 이후 진행 상황

@@ -261,3 +261,11 @@ real-vla      -> Real VLA-compatible 외부 서버 (실제 OpenVLA일 수도, ad
 **adapter-test mock 서버**: 실제 OpenVLA가 아직 없어도 이 adapter 구조 전체를 검증할 수 있도록 `openvla_server_dummy/real_vla_compatible_server.py`를 추가했습니다. `dummy_server.py`와 마찬가지로 내부적으로 `DummyOpenVLAPolicy`를 재사용하지만, 목적이 다릅니다: `dummy_server.py`는 "기존 dummy VLA backend"이고, 이 서버는 "실제 VLA 서버가 어떤 스키마로 붙을지 미리 검증하는 adapter test server"입니다(`info.model = "real-vla-compatible-mock"`으로 구분).
 
 **향후**: `openvla_server_dummy/real_vla_compatible_server.py`의 내부 구현(지금은 `DummyOpenVLAPolicy` 재사용)만 실제 OpenVLA 추론으로 바꾸면, `RealVLAPolicyClient`/`run_full_recycling_cell_demo.py` 어느 쪽도 변경할 필요가 없습니다 -- `configs/real_vla_backend_config.json`의 request/response 스키마가 바로 그 자리입니다.
+
+### Colab VLA Server Spike (v0)
+
+로컬 개발 머신에는 실제 OpenVLA(7B급)를 로딩할 GPU가 없습니다. `--policy-backend real-vla`가 이미 "서버가 어디 있든 상관없는" adapter 구조이므로, Google Colab의 무료 GPU 런타임에 임시 FastAPI VLA 서버(`openvla_server_real/colab_vla_server.py`)를 띄우고 ngrok/cloudflared HTTPS tunnel로 로컬의 `RealVLAPolicyClient`가 호출하도록 연결하는 spike를 추가했습니다. **Colab 서버는 절대 로봇을 실행하지 않습니다** -- action proposal만 반환하고, 실제 실행 여부는 여전히 로컬의 `policy/vla_action_postprocessor.py` -> `SafetyGate`/`SafetySupervisor` -> `RobotBackend` 체인이 결정합니다.
+
+`COLAB_VLA_SERVER_MODE` 환경변수로 `health-only`(모델 없음, `/predict`는 항상 실패) -> `mock-action`(`DummyOpenVLAPolicy` 재사용, 이번 spike의 실제 성공 기준) -> `openvla-dryrun`(실제 OpenVLA 로딩을 best-effort로 시도하되, GPU/의존성이 없으면 크래시 대신 `model_status=not_loaded`로 기록하고, 모델이 로드돼도 raw output을 검증 없이 실행 가능한 action으로 반환하지 않고 `action_adapter_required`를 반환) 순서로 검증합니다. `openvla-direct`는 구현하지 않았습니다.
+
+Colab의 tunnel URL은 세션마다 바뀌므로 `scripts/update_colab_vla_config.py --base-url <url> --config configs/real_vla_backend_colab_config.json`로 로컬 config만 갱신하면 됩니다(코드 변경 없음). Colab 세션이 끊겨도 `--real-vla-fallback-backend local-dummy`가 그대로 동작하는 것이 이 spike의 핵심 성공 기준입니다. 자세한 내용은 [docs/colab_vla_server_spike.md](colab_vla_server_spike.md)를 참고하세요.

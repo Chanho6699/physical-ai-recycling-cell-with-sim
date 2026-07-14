@@ -1,0 +1,44 @@
+{
+  "backend_name": "real_vla_colab_spike_v0",
+  "server_url": "https://REPLACE_WITH_COLAB_TUNNEL_URL/predict",
+  "health_url": "https://REPLACE_WITH_COLAB_TUNNEL_URL/health",
+  "timeout_sec": 45.0,
+  "image_encoding": {
+    "format": "jpg_base64",
+    "jpeg_quality": 90,
+    "resize": {
+      "enabled": true,
+      "width": 224,
+      "height": 224
+    }
+  },
+  "request_schema": {
+    "include_robot_state": true,
+    "include_task_goal": true,
+    "include_visual_observation": true,
+    "include_target_positions": true
+  },
+  "action_schema": {
+    "type": "delta_ee_7dof",
+    "order": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"],
+    "units": {
+      "translation": "meters",
+      "rotation": "radians"
+    }
+  },
+  "action_postprocess": {
+    "max_translation_step": 0.03,
+    "max_rotation_step": 0.10,
+    "gripper_threshold": 0.5,
+    "clip_action": true
+  },
+  "fallback": {
+    "enabled": true,
+    "backend": "local-dummy"
+  },
+  "logging": {
+    "save_raw_request": false,
+    "save_raw_response": true,
+    "save_debug_json": true
+  }
+}
