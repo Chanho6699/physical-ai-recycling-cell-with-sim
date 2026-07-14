@@ -25,6 +25,14 @@ results/isaacsim/
 *.engine
 *.trt
 *.weights
+*.safetensors
+*.bin
+models/
+checkpoints/
+
+# Colab OpenVLA Drive cache (never leaves Colab/Drive, but just in case
+# a local rsync copy or symlink ends up under the repo)
+openvla-cache/
 
 # Model weights and exported models
 weights/*.pt

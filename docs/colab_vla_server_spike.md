@@ -153,21 +153,66 @@ case this spike is built to record cleanly instead of crash on, and
 `action_adapter_required` error so the local `RealVLAPolicyClient`
 falls back.
 
+## OpenVLA Drive cache workflow
+
+OpenVLA-7B is ~15GB. Downloading it fresh at the start of every Colab
+session is slow, wastes quota, and means a dropped session loses all
+progress. `notebooks/colab_vla_server_spike_v0.ipynb`'s section 3b
+splits storage into two tiers instead:
+
+```text
+Google Drive (/content/drive/MyDrive/openvla-cache/openvla-7b)
+  -> permanent cache, survives across Colab sessions
+  -> populated once via huggingface_hub.snapshot_download(..., resume_download=True)
+       (resumable -- a dropped session just re-runs the same cell instead
+       of restarting the download from 0%)
+
+/content/openvla-7b (this session's local Colab VM disk)
+  -> fast-loading copy for *this session only*, made by rsync-ing
+     from the Drive cache
+  -> wiped when the session ends; next session only needs to re-run
+     the (fast, local) rsync copy, not snapshot_download again
+```
+
+`/load_model` only ever reads from a local path: it is wired up via
+`OPENVLA_MODEL_PATH=/content/openvla-7b` and
+`OPENVLA_LOCAL_FILES_ONLY=1` (see [Lazy model loading](#lazy-model-loading-openvla-dryrun-only)
+above), so a working Drive cache means `/load_model` never re-downloads
+anything from Hugging Face -- it either loads straight from
+`/content/openvla-7b` or fails fast with a local-file error.
+
+**Download success and model-loading success are two different
+things**, and the notebook's section 6b explains how to tell them
+apart:
+
+- A **`CUDA out of memory`** failure means the cache is fine -- the
+  download and copy worked -- but this Colab GPU tier doesn't have
+  enough VRAM to hold the model. That's a compute limit, not a data
+  problem; retrying `/load_model` won't help without a bigger GPU.
+- A **missing-file/shard** failure under `local_files_only=True` means
+  the Drive cache itself is incomplete. Re-run the `snapshot_download`
+  cell (resumable, so this is cheap) and then the `rsync` copy cell
+  again.
+
+**Do not commit to Git**: model weights/checkpoints, the Drive cache
+directory itself (it never leaves Colab/Drive, but just to be clear),
+`results/`, `datasets/`, or any temporary `cloudflared`/ngrok tunnel
+URL baked into a config file. `configs/real_vla_backend_colab_config.json`
+is meant to be edited in place by `scripts/update_colab_vla_config.py`
+each session -- if you commit a real tunnel URL into it, the next
+person to clone the repo will just see a dead URL (Colab sessions
+don't persist), which is harmless but pointless to track in Git.
+
 ## Using it
 
 ### 1. Run the notebook
 
-Open `notebooks/colab_vla_server_spike_v0.ipynb` in Colab, fill in
-`REPO_URL` (cell 3), pick a `SERVER_MODE` (cell 4, start with
-`mock-action`), run all cells through cell 6 ("Test curl commands"),
-and copy the printed `public_url`. The server is fully up and
-`/health`-reachable at this point regardless of `SERVER_MODE`.
+Open `notebooks/colab_vla_server_spike_v0.ipynb` in Colab and run it top to bottom. Two paths:
 
-If (and only if) you set `SERVER_MODE = "openvla-dryrun"` and actually
-want to try loading the real model, run cell 6b
-(`POST /load_model`) next -- it's the only cell that ever downloads
-anything, it's optional, and it can take a while (or fail) without
-taking the server down with it.
+- **Just checking connectivity (no GPU/OpenVLA needed)**: run section 1 (GPU check, informational only), section 2 (base deps), then skip straight to section 3 (repo clone) and section 4 -- set `SERVER_MODE = "mock-action"` there instead of the notebook's default. Skip sections 2b/2c/3b entirely. Continue from section 5 onward.
+- **Real OpenVLA `openvla-dryrun` load (this notebook's default)**: run every section in order -- 1 (GPU check) -> 2/2b/2c (deps + import validation) -> 3 (repo clone) -> **3b (Drive cache: mount Drive, HF login, `snapshot_download` to Drive, copy to `/content/openvla-7b`, local-only processor smoke test)** -> 4 (sets `SERVER_MODE="openvla-dryrun"` + `OPENVLA_MODEL_PATH`/`OPENVLA_LOCAL_FILES_ONLY`, imports the app) -> 5 (start server + tunnel) -> 6 (curl commands, expected `/health` shown inline) -> **6b (`POST /load_model` -- the only cell that ever triggers a real model load; see "OpenVLA Drive cache workflow" above for how to read a failure here)**.
+
+Either way, the server is fully up and `/health`-reachable as soon as section 5 finishes, regardless of `SERVER_MODE` -- section 6b is always optional and always separate from the server actually being alive.
 
 ### 2. Update the local config
 
