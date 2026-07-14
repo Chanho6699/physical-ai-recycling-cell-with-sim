@@ -51,9 +51,11 @@ datasets/raw_episodes/episode_<timestamp>_<id>/
 
 `--record-policy-observations`가 켜져 있으면, 매 step `episode.json`의 그 step에 `policy_output`(`action`/`policy_backend`/`inference_latency_ms`/`used_image_input`/`observation_source`)이 `extra`로 기록되고, `--policy-observation-source wrist`가 실제로 관찰을 넣은 step에는 `policy_input`(`image_source`/`image_shape`/`has_image`)과 `wrist_observation`(`object_visible`/`object_pixel_count`/`object_bbox_px`/`estimated_world_position`)도 함께 남습니다. `metadata.json`의 `policy_observation` 섹션에는 episode 전체를 통틀어 `used_wrist_observation_steps`(실제로 wrist 이미지를 policy input으로 사용한 step 수)와 `recorded_wrist_observation_steps`(그중 이미지 파일까지 저장된 step 수)가 요약됩니다.
 
-### policy backend (`--policy-backend local-dummy | fastapi-dummy`)
+### policy backend (`--policy-backend local-dummy | fastapi-dummy | real-vla`)
 
-`metadata.json`의 `robot` 섹션에 `policy_backend`(`local-dummy`/`fastapi-dummy`), `policy_server_url`(fastapi-dummy일 때만), `avg_inference_latency_ms`(episode 전체 step의 평균 왕복 지연시간, fastapi-dummy일 때만 값이 채워짐)가 추가됐습니다. `local-dummy`는 in-process deterministic placeholder(`DummyOpenVLAPolicy`를 직접 호출)이고, `fastapi-dummy`는 external inference-server-style placeholder(`openvla_server_dummy/dummy_server.py`에 HTTP로 같은 `DummyOpenVLAPolicy`를 호스팅)입니다 -- 둘 다 같은 VLA 스타일 `PolicyInput`/`PolicyOutput` 개념을 공유하므로, 나중에 실제 OpenVLA가 `fastapi-dummy`의 서버 구현부만 대체하면 이 데이터 스키마와 control loop는 그대로 재사용됩니다. 지금의 fastapi dummy server는 image content로 learned visual reasoning을 하지 않고, `inference_latency_ms`만 기록해서 나중에 real model과 비교할 수 있는 자리를 마련해 둔 상태입니다.
+`metadata.json`의 `robot` 섹션에 `policy_backend`(`local-dummy`/`fastapi-dummy`/`real-vla`), `policy_server_url`(fastapi-dummy/real-vla일 때), `model`(real-vla일 때 서버가 보고한 모델 이름, 예: `real-vla-compatible-mock`), `fallback_backend`/`fallback_used_count`(real-vla일 때), `avg_inference_latency_ms`, `avg_image_encoding_latency_ms`(real-vla일 때만 채워짐), `action_schema`(real-vla일 때, 예: `delta_ee_7dof`)가 있습니다. `local-dummy`는 in-process deterministic placeholder(`DummyOpenVLAPolicy`를 직접 호출)이고, `fastapi-dummy`는 external inference-server-style placeholder(`openvla_server_dummy/dummy_server.py`에 HTTP로 같은 `DummyOpenVLAPolicy`를 호스팅)이고, `real-vla`는 실제 OpenVLA/VLA 모델 서버가 들어올 수 있는 adapter 계층(`policy/real_vla_policy_client.py::RealVLAPolicyClient`, 오늘은 `openvla_server_dummy/real_vla_compatible_server.py`에 연결)입니다 -- 셋 다 같은 VLA 스타일 `PolicyInput`/`PolicyOutput` 개념을 공유하므로, 나중에 실제 OpenVLA가 `real_vla_compatible_server.py`의 서버 구현부만 대체하면 이 데이터 스키마와 control loop는 그대로 재사용됩니다.
+
+step-level `policy_output`(`--record-policy-observations`)에는 `model`/`image_encoding_latency_ms`/`fallback_used`/`action_postprocess`(`translation_clipped`/`rotation_clipped`/`gripper_normalized`)가 추가로 남습니다. `real-vla` 서버 요청이 실패하면(`connection_error`/`timeout`/`invalid_json`/`missing_action_field`/`invalid_action`) `--real-vla-fallback-backend`(기본 `local-dummy`)가 자동으로 action을 대신 생성하고, `fallback_used_count`가 fallback이 쓰인 step 수를 기록합니다.
 
 `DummyOpenVLAPolicy`는 이 이미지 내용을 실제로 해석하지 않는 placeholder이지만, 이 구조 덕분에 나중에 real OpenVLA를 같은 `PolicyInput`/`PolicyOutput` 인터페이스로 꽂아 넣어도 기록되는 데이터 형태는 그대로입니다.
 
@@ -140,13 +142,14 @@ gripper_action[t]    = "close" | "open" | "hold"   (gripper_width[t+1] - gripper
 
 ## 5. Episode inspector
 
-`benchmark/inspect_recorded_episode.py --episode-dir <경로>`가 `metadata.json`(없으면 `episode.json`의 `metadata` 필드로 fallback)을 읽어서 instruction, real2sim mode/mapped position, wrist camera refinement 적용 여부와 몇 번째 step에서 일어났는지, `safety_mode`가 `off`가 아니면 `hand_safety_source`(+`external-camera`면 `hand_detector_backend`, 아니면 `mock_hand_intrusion`)/`safety_pause_count`/`safety_resume_count`/`paused_steps`/`hand_intrusion_events`/`final_safety_state`, policy_backend(및 `fastapi-dummy`면 `avg_inference_latency_ms`), policy_steps, final_status를 한 화면에 요약합니다. 전체 JSON을 열어보지 않고도 이 episode에서 무슨 일이 있었는지 빠르게 확인하는 용도입니다.
+`benchmark/inspect_recorded_episode.py --episode-dir <경로>`가 `metadata.json`(없으면 `episode.json`의 `metadata` 필드로 fallback)을 읽어서 instruction, real2sim mode/mapped position, wrist camera refinement 적용 여부와 몇 번째 step에서 일어났는지, `safety_mode`가 `off`가 아니면 `hand_safety_source`(+`external-camera`면 `hand_detector_backend`, 아니면 `mock_hand_intrusion`)/`safety_pause_count`/`safety_resume_count`/`paused_steps`/`hand_intrusion_events`/`final_safety_state`, policy_backend(`fastapi-dummy`면 `avg_inference_latency_ms`, `real-vla`면 `model`/`policy_server_url`/`fallback_backend`/`fallback_used_count`/`avg_inference_latency_ms`/`avg_image_encoding_latency_ms`), policy_steps, final_status를 한 화면에 요약합니다. 전체 JSON을 열어보지 않고도 이 episode에서 무슨 일이 있었는지 빠르게 확인하는 용도입니다.
 
 ## 6. 앞으로 (future)
 
 - LeRobot 공식 parquet/video 포맷으로 변환하는 exporter 추가
 - HuggingFace Hub 업로드 (아직 하지 않음)
 - Safety Pause/Resume: 외부 카메라 hand intrusion detector(v1, `--hand-safety-source external-camera`)에 이어 wrist camera 기반 hand safety, 외부+wrist 카메라 fusion, 실제 하드웨어 ROS2 e-stop 브릿지
+- Real VLA Backend Adapter: `openvla_server_dummy/real_vla_compatible_server.py`의 내부를 실제 OpenVLA 추론으로 교체 (아직 하지 않음, `RealVLAPolicyClient`/`configs/real_vla_backend_config.json` 스키마는 이미 준비됨)
 - 실제 OpenVLA fine-tuning에 이 dataset을 사용하는 것 (아직 하지 않음)
 - 회전(δroll/δpitch/δyaw)이 실제로 의미를 갖는 조작(물체 방향 조정 등)이 추가되면 그에 맞춰 action 정의 확장
 - 지금은 `frames/`에 wrist camera rgb/depth/segmentation 이미지 자체를 복사하지 않고 `results/wrist_camera/`의 경로만 step 이벤트에 남깁니다 -- episode 폴더를 완전히 독립적으로 만들려면 이 파일들도 함께 복사하는 것이 다음 개선 지점입니다.

@@ -483,6 +483,56 @@ python -m benchmark.run_full_recycling_cell_demo \
 
 손이 없으면 `hand_detected: False`, `safety_pause_count: 0`, `final_status: success`, `PASS`. 로봇이 움직이는 중 실제로 손을 ArUco workspace 안에 넣으면 `hand_detected: True`, `hand_in_workspace: True`, `safety_pause_count: 1`, 손을 빼면 (`--safety-resume-stable-steps`, 기본 3프레임 연속 clear 후) `safety_resume_count: 1`, 최종적으로 `final_status: success`, `PASS`. 이 조합도 카메라 화면 안에 실제로 ArUco 마커 4개와 플라스틱 병이 있어야 YOLO detection부터 통과합니다 -- 화면에 마커/병이 없으면 pause/resume 이전 단계(`No detections found`)에서 끝나는 것이 정상입니다. `--save-hand-safety-debug-images`를 주면 매 step `results/safety_hand_debug/hand_safety_step_<step>.png`에 workspace polygon/손 landmark/bbox/상태 텍스트가 그려진 디버그 이미지가 저장됩니다.
 
+## 26. Real VLA Backend Adapter 확인 (v0)
+
+실제 OpenVLA를 로컬에 로딩하지 않고도, 실제 VLA 서버가 붙을 수 있는 adapter 구조(config/전처리/후처리/fallback/latency logging)를 검증합니다. 터미널 1에서 adapter-test mock 서버를 띄웁니다(`DummyOpenVLAPolicy`를 재사용하지만, `fastapi-dummy`와 달리 실제 VLA 서버가 쓸 스키마를 검증하는 것이 목적입니다):
+
+```bash
+uvicorn openvla_server_dummy.real_vla_compatible_server:app \
+  --host 127.0.0.1 \
+  --port 9000
+```
+
+터미널 2에서 probe로 health/action/postprocessing을 확인합니다:
+
+```bash
+python -m benchmark.probe_real_vla_policy_client \
+  --real-vla-config configs/real_vla_backend_config.json \
+  --with-image
+```
+
+기대 결과: `health: ok`, `policy_backend: real-vla`, `model: real-vla-compatible-mock`, `action_len: 7`, `postprocess_ok: True`, `inference_latency_ms: ...`, **PASS**.
+
+전체 데모에서 `--policy-backend real-vla`를 사용합니다:
+
+```bash
+python -m benchmark.run_full_recycling_cell_demo \
+  --policy dummy-openvla \
+  --policy-backend real-vla \
+  --real-vla-config configs/real_vla_backend_config.json \
+  --instruction "플라스틱 병을 플라스틱 수거함에 넣어줘" \
+  --image-path data/test_images/recyclable_scene.jpg \
+  --wrist-camera-mode refine \
+  --wrist-refinement-policy blend \
+  --policy-observation-source wrist \
+  --record \
+  --record-perception-metadata \
+  --record-policy-observations \
+  --headless
+```
+
+기대 결과: `policy_backend: real-vla`, `model: real-vla-compatible-mock`, `used_wrist_observation_steps > 0`, `wrist_refinement_applied: True`, `final_status: success`, **PASS** -- local-dummy/fastapi-dummy와 동일한 `policy_steps`로 끝납니다(서버가 결국 같은 `DummyOpenVLAPolicy`를 실행하기 때문).
+
+**Fallback 확인**: 9000 서버를 끈 상태에서 같은 probe를 실행하면(기본 `--real-vla-fallback-backend local-dummy`),
+
+```bash
+python -m benchmark.probe_real_vla_policy_client \
+  --real-vla-config configs/real_vla_backend_config.json \
+  --with-image
+```
+
+`real_vla_request_failed: True`, `fallback_used: True`, `fallback_backend: local-dummy`, `action_len: 7`, **PASS**로 끝납니다 -- 서버 없이도 개발을 계속할 수 있습니다. `--real-vla-fallback-backend none`으로 fallback을 끄면, traceback 대신 사람이 읽을 수 있는 `RuntimeError` 메시지와 함께 `FAIL`로 끝납니다.
+
 ## Deprecated: 구식 `/predict_action` 데모
 
 `openvla_client/client_test.py`, `benchmark/run_pybullet_backend_pipeline.py`, `benchmark/run_task_pipeline.py`, `benchmark/run_dummy_pipeline.py`, `benchmark/run_robot_dummy_pipeline.py`, `benchmark/run_robot_backend_pipeline.py`는 `openvla_server_dummy/dummy_server.py`가 `/predict`, `/health`, `/reset`으로 정리되기 전의 구식 `/predict_action` endpoint를 사용하는 초기 단계 데모라 지금의 서버와 호환되지 않습니다. 각 파일 상단에 deprecated 주석을 남겨뒀고, 이 문서의 권장 경로에는 포함하지 않습니다 -- 대신 21~23번(FastAPI dummy VLA policy backend) 또는 `run_full_recycling_cell_demo.py --policy-backend fastapi-dummy`를 사용하세요.

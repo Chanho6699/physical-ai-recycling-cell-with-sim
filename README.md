@@ -66,7 +66,7 @@ Dataset Export / Replay Validation
 | PyBulletPandaBackend | Franka Panda URDF, IK 기반 end-effector 이동, gripper open/close, grasp/place 판정, task_status 관리 (`RobotBackend`/`SimulatorBackend` 인터페이스 구현) |
 | Wrist camera + grasp refinement | end-effector에 붙은 가상 eye-in-hand 카메라로 물체 위치를 근거리에서 재추정, grasp target 보정 |
 | VLA-ready per-step observation | 매 policy step마다 wrist camera RGB를 `PolicyInput.image`로 전달하는 online control loop |
-| PolicyBackend (local-dummy / fastapi-dummy) | `DummyOpenVLAPolicy`(in-process)와 `FastAPIVLAPolicyClient`(HTTP, `openvla_server_dummy/dummy_server.py`)가 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현 -- 실제 OpenVLA 서버로 교체 가능한 자리 |
+| PolicyBackend (local-dummy / fastapi-dummy / real-vla) | `DummyOpenVLAPolicy`(in-process), `FastAPIVLAPolicyClient`(HTTP, `openvla_server_dummy/dummy_server.py`), `RealVLAPolicyClient`(HTTP + config 기반 image preprocessing/action postprocessing/fallback, `openvla_server_dummy/real_vla_compatible_server.py`)가 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현 -- 실제 OpenVLA 서버로 교체 가능한 자리 |
 | SafetyGate | action 실행 전(및 이동 중) hazard 여부를 점검해서 차단 (mock / ONNX YOLO 모두 지원) |
 | Safety Pause/Resume + SafetySupervisor | hand 침입 시 로봇 action 적용을 일시정지하고, 손이 사라지면 종료 없이 이어서 진행 (mock-timed v0, 실제 외부 카메라 MediaPipe hand detector v1) |
 | CameraBackend / RobotBackend 추상화 | 외부 카메라(iVCam/webcam/정적 이미지)/로봇(PyBullet/향후 실제 하드웨어)을 인터페이스 뒤에 두어 하드웨어 이식 경로를 명확히 함 |
@@ -120,7 +120,8 @@ python -m benchmark.run_full_recycling_cell_demo \
   - phase: `move_to_object → close_gripper → lift_object → move_above_bin → open_gripper → done`
   - 기본 실행/기록 실행/mock hazard 시나리오 모두 PASS로 검증했습니다.
 - **fastapi-dummy** (`--policy-backend fastapi-dummy`, `policy/fastapi_vla_policy_client.py::FastAPIVLAPolicyClient`): `DummyOpenVLAPolicy`를 그대로 호스팅하는 FastAPI 서버(`openvla_server_dummy/dummy_server.py`)에 HTTP로 요청하는 클라이언트입니다. `local-dummy`와 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하므로 control loop는 어느 backend인지 신경 쓰지 않고, 실제로 같은 `policy_steps`로 끝납니다(같은 phase 엔진을 실행하기 때문).
-- **future**: 위 policy들과 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하는 실제 OpenVLA 클라이언트로 교체 가능하도록 설계했습니다. 아직 구현하지 않았습니다.
+- **real-vla** (`--policy-backend real-vla`, `policy/real_vla_policy_client.py::RealVLAPolicyClient`): 실제 OpenVLA/VLA 모델 서버가 들어올 수 있는 adapter 계층입니다. 서버 주소/이미지 인코딩/action clipping을 `configs/real_vla_backend_config.json`에서 읽고, VLA 응답 action은 항상 `policy/vla_action_postprocessor.py`로 검증/후처리한 뒤에만 적용됩니다. 서버 연결 실패 시 `--real-vla-fallback-backend`(기본 `local-dummy`)로 자동 전환합니다. 로컬 GPU/VRAM 부담을 피하기 위해 이번 v0은 실제 대형 모델을 로딩하지 않고, adapter-test mock 서버(`openvla_server_dummy/real_vla_compatible_server.py`, 내부적으로 `DummyOpenVLAPolicy` 재사용)로 스키마를 검증했습니다.
+- **future**: 위 policy들과 동일한 `BasePolicy`/`PolicyBackend` 인터페이스를 구현하는 실제 OpenVLA 모델로 `real_vla_compatible_server.py`의 내부를 교체. 아직 구현하지 않았습니다.
 
 ## 8. dataset / replay 검증
 
@@ -145,7 +146,7 @@ python -m benchmark.run_full_recycling_cell_demo \
 
 이 프로젝트는 아직 다음을 포함하지 않습니다. 과장하지 않기 위해 명확히 남겨둡니다.
 
-- 실제 OpenVLA 모델은 아직 연결하지 않았습니다. `DummyOpenVLAPolicy`는 이름과 달리 모델이 아니라 rule-based scripted policy이고, FastAPI 서버(`openvla_server_dummy/`)도 이 `DummyOpenVLAPolicy`를 그대로 호스팅할 뿐 실제 VLA 모델이 아닙니다.
+- 실제 OpenVLA 모델은 아직 연결하지 않았습니다. `DummyOpenVLAPolicy`는 이름과 달리 모델이 아니라 rule-based scripted policy이고, `openvla_server_dummy/`의 두 서버(`dummy_server.py`, `real_vla_compatible_server.py`) 모두 이 `DummyOpenVLAPolicy`를 그대로 호스팅할 뿐 실제 VLA 모델이 아닙니다. `--policy-backend real-vla`는 실제 서버가 들어올 adapter 구조(스키마/전처리/후처리/fallback)만 준비했을 뿐, GPU 추론이나 대형 모델 로딩은 의도적으로 하지 않았습니다.
 - OpenVLA fine-tuning은 아직 수행하지 않았습니다.
 - LeRobot 공식 parquet/video 포맷 변환은 아직 수행하지 않았습니다. 현재 dataset exporter는 JSONL 기반의 "LeRobot 스타일" 로컬 포맷입니다.
 - LLM Agent 기반 multi-step planning은 아직 없습니다. `RuleBasedTaskGoalParser`는 rule-based 단일 명령 파서입니다.
@@ -156,7 +157,7 @@ python -m benchmark.run_full_recycling_cell_demo \
 ## 11. 다음 확장 계획
 
 - `RealRobotBackend`/`ROS2RobotBackend` skeleton을 실제 하드웨어 제어 코드로 채우기
-- 실제 OpenVLA 모델을 서빙하는 `PolicyBackend` 어댑터로 교체 (지금의 `FastAPIVLAPolicyClient`와 같은 `/predict` 계약을 실제 모델이 채우면 됨)
+- 실제 OpenVLA 모델로 `real_vla_compatible_server.py`의 내부를 교체 (지금의 `RealVLAPolicyClient`/`configs/real_vla_backend_config.json` 계약은 이미 준비됨)
 - LeRobot 공식 parquet/video 포맷 변환 지원
 - LLM Agent 기반 multi-step task planning
 - wrist camera 기반 hand safety + 외부 카메라와의 fusion

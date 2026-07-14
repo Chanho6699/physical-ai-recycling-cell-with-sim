@@ -41,7 +41,7 @@ Dataset Export / Replay Validation
 |---|---|---|
 | `RobotBackend` | `robot_core/robot_backend.py` | `PyBulletPandaBackend` |
 | `CameraBackend` | `vision/camera_backend.py` | `WebcamCameraBackend`, `StaticImageCameraBackend`, `PyBulletWristCameraBackend` |
-| `PolicyBackend` (= `BasePolicy`) | `policy/policy_backend.py`, `policy/base_policy.py` | `DummyOpenVLAPolicy`, `FastAPIVLAPolicyClient` |
+| `PolicyBackend` (= `BasePolicy`) | `policy/policy_backend.py`, `policy/base_policy.py` | `DummyOpenVLAPolicy`, `FastAPIVLAPolicyClient`, `RealVLAPolicyClient`(`--policy-backend real-vla`, adapter for a future real OpenVLA/VLA server) |
 | `SafetySupervisor` | `safety/safety_supervisor.py` | pause/resume state machine (mock 또는 external-camera hand intrusion 신호 기반) |
 
 `run_full_recycling_cell_demo.py`의 `create_robot_backend(args)` / `create_policy_backend(args)` / `create_external_camera_backend(args)` / `create_hand_safety_monitor(args, ...)` 네 helper 함수가 각 인터페이스의 실제 구현체를 결정하는 유일한 지점입니다 -- control loop 나머지 코드는 이 함수들이 반환한 객체의 인터페이스 메서드만 호출합니다. 하드웨어로 옮길 때는 이 네 함수의 반환값만 바꾸면 됩니다.
@@ -243,3 +243,21 @@ ROI linear mapping(`CalibratedImageToSimMapper`)은 여전히 baseline으로 남
 `GET /health`, `POST /reset`(episode 시작 시 서버의 `DummyOpenVLAPolicy` phase를 리셋)도 있습니다. 서버는 단일 글로벌 policy 인스턴스만 유지하므로, 한 번에 하나의 episode만 구동하는 이번 v0 용도로 충분하고 동시 다중 episode 서빙은 지원하지 않습니다.
 
 **향후**: `openvla_server_dummy/dummy_server.py`의 `/predict` 구현부만 실제 OpenVLA 추론으로 바꾸면, `FastAPIVLAPolicyClient`/`run_full_recycling_cell_demo.py` 어느 쪽도 변경할 필요가 없습니다 -- 지금 이 v0의 request/response 스키마가 바로 그 자리입니다.
+
+### Real VLA Backend Adapter (v0): `--policy-backend real-vla`
+
+`fastapi-dummy`가 "policy를 네트워크 너머로 분리해도 control loop가 그대로 동작하는지"를 검증한 것이라면, `real-vla`는 그 네트워크 경계에 **실제 OpenVLA/VLA 모델 서버가 들어올 수 있는 adapter 계층**입니다. 이번 v0의 원칙은 명확합니다: **로컬 GPU/VRAM에 실제 대형 VLA 모델을 로딩하지 않는다.** 대신 서버 스키마, image preprocessing, action validation/postprocessing, fallback, latency logging을 먼저 갖추고, 실제 모델 실행 자체는 optional로 둡니다.
+
+```text
+local-dummy   -> DummyOpenVLAPolicy in-process
+fastapi-dummy -> openvla_server_dummy/dummy_server.py (같은 DummyOpenVLAPolicy를 HTTP로)
+real-vla      -> Real VLA-compatible 외부 서버 (실제 OpenVLA일 수도, adapter 검증용 mock일 수도)
+```
+
+`policy/real_vla_policy_client.py`의 `RealVLAPolicyClient`가 `BasePolicy`/`PolicyBackend`를 구현합니다. 서버 주소를 코드에 하드코딩하지 않고 `configs/real_vla_backend_config.json`에서 읽습니다(`server_url`, `health_url`, `timeout_sec`, image encoding/resize 설정, action schema, action postprocess clipping 값, fallback 설정). 이미지 전처리는 `policy/vla_image_preprocessor.py::encode_policy_image_for_vla()`(optional resize + JPEG base64 인코딩 + `encoding_latency_ms` 기록)로, action 검증/후처리는 `policy/vla_action_postprocessor.py::validate_and_postprocess_vla_action()`(길이 7 확인, NaN/inf 거부, translation/rotation clipping, gripper 임계값 정규화)로 각각 독립 모듈로 분리했습니다 -- **VLA가 반환한 action을 그대로 로봇에 적용하지 않고, 항상 이 postprocess를 거친 뒤에야** `ActionAdapter`로 넘어갑니다(그리고 그 뒤에도 여전히 SafetyGate/SafetySupervisor를 거칩니다 -- VLA action의 유효성 검증과 safety 판단은 서로 다른 두 단계입니다).
+
+**Fallback**: `--real-vla-fallback-backend {none,local-dummy,fastapi-dummy}`(기본 `local-dummy`)로 실제 서버가 없어도 개발을 계속할 수 있습니다. 연결 실패/timeout/invalid JSON/action 누락/action 형식 오류가 발생하면 `RealVLAPolicyClient`가 자동으로 fallback policy의 `predict_action()`을 호출하고, `info`에 `real_vla_request_failed=True`/`fallback_used=True`를 남깁니다. fallback이 `none`이면 traceback 대신 사람이 읽을 수 있는 `RuntimeError`를 던집니다.
+
+**adapter-test mock 서버**: 실제 OpenVLA가 아직 없어도 이 adapter 구조 전체를 검증할 수 있도록 `openvla_server_dummy/real_vla_compatible_server.py`를 추가했습니다. `dummy_server.py`와 마찬가지로 내부적으로 `DummyOpenVLAPolicy`를 재사용하지만, 목적이 다릅니다: `dummy_server.py`는 "기존 dummy VLA backend"이고, 이 서버는 "실제 VLA 서버가 어떤 스키마로 붙을지 미리 검증하는 adapter test server"입니다(`info.model = "real-vla-compatible-mock"`으로 구분).
+
+**향후**: `openvla_server_dummy/real_vla_compatible_server.py`의 내부 구현(지금은 `DummyOpenVLAPolicy` 재사용)만 실제 OpenVLA 추론으로 바꾸면, `RealVLAPolicyClient`/`run_full_recycling_cell_demo.py` 어느 쪽도 변경할 필요가 없습니다 -- `configs/real_vla_backend_config.json`의 request/response 스키마가 바로 그 자리입니다.

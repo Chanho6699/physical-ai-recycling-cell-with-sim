@@ -111,6 +111,13 @@ def main() -> None:
         if policy_backend == "fastapi-dummy":
             print(f"policy_server_url: {robot.get('policy_server_url')}")
             print(f"avg_inference_latency_ms: {robot.get('avg_inference_latency_ms')}")
+        elif policy_backend == "real-vla":
+            print(f"model: {robot.get('model')}")
+            print(f"policy_server_url: {robot.get('policy_server_url')}")
+            print(f"fallback_backend: {robot.get('fallback_backend')}")
+            print(f"fallback_used_count: {robot.get('fallback_used_count')}")
+            print(f"avg_inference_latency_ms: {robot.get('avg_inference_latency_ms')}")
+            print(f"avg_image_encoding_latency_ms: {robot.get('avg_image_encoding_latency_ms')}")
     print(f"policy_steps: {policy_steps}")
     print(f"final_status: {final_status}")
 

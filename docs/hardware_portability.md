@@ -19,7 +19,7 @@ narrower "what changes when this stops being a simulation" view.
 | Robot | `RobotBackend` (`robot_core/robot_backend.py`) | `PyBulletPandaBackend` (`robot_sim/pybullet_panda_backend.py`) |
 | External camera | `CameraBackend` (`vision/camera_backend.py`) | `WebcamCameraBackend` (iVCam/webcam relay URL), `StaticImageCameraBackend` (`--image-path`) |
 | Wrist camera | `CameraBackend` | `PyBulletWristCameraBackend` wrapping `PyBulletWristCamera` (virtual eye-in-hand camera) |
-| Policy | `PolicyBackend` = `BasePolicy` (`policy/policy_backend.py`, `policy/base_policy.py`) | `DummyOpenVLAPolicy` (`--policy-backend local-dummy`), `FastAPIVLAPolicyClient` (`--policy-backend fastapi-dummy`, talks to `openvla_server_dummy/dummy_server.py`) |
+| Policy | `PolicyBackend` = `BasePolicy` (`policy/policy_backend.py`, `policy/base_policy.py`) | `DummyOpenVLAPolicy` (`--policy-backend local-dummy`), `FastAPIVLAPolicyClient` (`--policy-backend fastapi-dummy`, talks to `openvla_server_dummy/dummy_server.py`), `RealVLAPolicyClient` (`--policy-backend real-vla`, talks to `openvla_server_dummy/real_vla_compatible_server.py` today; the adapter layer a real OpenVLA/VLA server plugs into) |
 | Safety (hard block) | `SafetyMonitor` + `SafetyGate` (`safety/safety_monitor.py`, `safety/safety_gate.py`) | `MockSafetyMonitor`, `ONNXRuntimeYOLOSafetyMonitor` (`--safety-monitor mock/onnx`) |
 | Safety (pause/resume) | `SafetyMonitor` + `SafetySupervisor` (`safety/safety_supervisor.py`) | `MockHandIntrusionMonitor` (mock-timed, v0), `ExternalCameraHandSafetyMonitor` (real MediaPipe hand detection, v1) |
 | Dataset | -- | Custom raw episode JSON (`TrajectoryRecorder`) + LeRobot-style JSONL exporter (`LeRobotDatasetExporter`) -- not official LeRobot parquet/video format |
@@ -40,7 +40,7 @@ one factory function, not the control loop.
 | `PyBulletPandaBackend` | `RealRobotBackend` (vendor SDK/controller API) or `ROS2RobotBackend` (MoveIt2 + `follow_joint_trajectory`) -- both are unimplemented skeletons today (`robot_core/real_robot_backend.py`, `robot_core/ros2_robot_backend.py`), every method raises `NotImplementedError` with a docstring describing what to implement |
 | PyBullet virtual wrist camera | A real wrist-mounted camera's `CameraBackend` (e.g. an Intel RealSense/similar over its own SDK or a `ROS2CameraBackend` subscribing to a wrist-mounted `/camera/.../image_raw`) |
 | iVCam (phone camera over a Windows relay) | A calibrated, fixed external camera (proper intrinsics, fixed mount, ideally on the same network segment as the robot controller instead of a phone relay) |
-| FastAPI dummy VLA server | A real OpenVLA (or other VLA) inference server behind the same `/predict`/`/health`/`/reset` contract `FastAPIVLAPolicyClient` already speaks, or a new `PolicyBackend` implementation entirely |
+`real-vla-compatible-server`'s `DummyOpenVLAPolicy` internals | A real OpenVLA (or other VLA) inference server behind the same `/predict`/`/health`/`/reset` contract and `configs/real_vla_backend_config.json` schema `RealVLAPolicyClient` already speaks -- only `openvla_server_dummy/real_vla_compatible_server.py`'s internals need to change, not the client or the control loop |
 | `MockHandIntrusionMonitor` / `ExternalCameraHandSafetyMonitor`'s MediaPipe hands | A production-grade hand/person detector, ideally fused across external + wrist cameras, and always backed by a **hardware** e-stop -- `SafetySupervisor` deciding an action may be applied is a software safety layer, not a substitute for a physical interlock |
 | Custom raw episode / LeRobot-style JSONL exporter | Official LeRobot parquet/video dataset format + HF Hub upload |
 
@@ -57,7 +57,7 @@ would have to work through, in roughly the order it becomes necessary:
 
 ## What is explicitly still simulation-only / not done
 
-- No real OpenVLA model connected (`FastAPIVLAPolicyClient` talks to a dummy server that runs `DummyOpenVLAPolicy` server-side).
+- No real OpenVLA model connected. `FastAPIVLAPolicyClient` talks to a dummy server that runs `DummyOpenVLAPolicy` server-side; `RealVLAPolicyClient` (the adapter layer meant for a real VLA server) talks to `real_vla_compatible_server.py`, which does the same thing under a schema closer to what a real server would expect. Real model execution is deliberately optional in this v0 (no GPU inference requirement, no forced large-model download) -- see [docs/architecture.md](architecture.md#real-vla-backend-adapter-v0---policy-backend-real-vla).
 - No ROS2 control (`ROS2RobotBackend`/`ROS2CameraBackend` are unimplemented skeletons; rclpy is imported lazily so the rest of the project works without ROS2 installed).
 - No official LeRobot parquet/video format or HF Hub upload.
 - No LLM-agent multi-step planning (`llm_agent/rule_based_parser.py` is a single rule-based instruction parser, not a planner).

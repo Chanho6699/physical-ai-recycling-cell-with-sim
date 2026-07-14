@@ -59,6 +59,7 @@ from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.fastapi_vla_policy_client import FastAPIVLAPolicyClient
 from policy.policy_backend import PolicyBackend
 from policy.policy_types import PolicyInput
+from policy.real_vla_policy_client import RealVLAPolicyClient
 from real2sim.aruco_table_mapper import ArUcoTableMapper, draw_aruco_debug_image, print_aruco_mapping_debug
 from real2sim.calibrated_image_to_sim_mapper import (
     CalibratedImageToSimMapper,
@@ -94,6 +95,7 @@ DEFAULT_WRIST_CAMERA_CONFIG = "configs/wrist_camera_config.json"
 WRIST_CAMERA_OUTPUT_DIR = "results/wrist_camera"
 DEFAULT_HAND_SAFETY_CONFIG = "configs/hand_safety_config.json"
 HAND_SAFETY_DEBUG_OUTPUT_DIR = "results/safety_hand_debug"
+DEFAULT_REAL_VLA_CONFIG = "configs/real_vla_backend_config.json"
 
 # How far above the object (in the object's own xy) the end effector
 # moves to before rendering the wrist camera in --wrist-camera-mode
@@ -150,9 +152,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-policy-observations", action="store_true")
     parser.add_argument("--policy-observation-save-interval", type=int, default=5)
 
-    parser.add_argument("--policy-backend", choices=["local-dummy", "fastapi-dummy"], default="local-dummy")
+    parser.add_argument("--policy-backend", choices=["local-dummy", "fastapi-dummy", "real-vla"], default="local-dummy")
     parser.add_argument("--policy-server-url", type=str, default="http://127.0.0.1:8000/predict")
     parser.add_argument("--policy-request-timeout", type=float, default=5.0)
+
+    parser.add_argument("--real-vla-config", type=str, default=DEFAULT_REAL_VLA_CONFIG)
+    parser.add_argument(
+        "--real-vla-fallback-backend", choices=["none", "local-dummy", "fastapi-dummy"], default="local-dummy"
+    )
 
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
 
@@ -280,19 +287,35 @@ def create_robot_backend(args) -> RobotBackend:
     return PyBulletPandaBackend(gui=args.gui)
 
 
-def create_policy_backend(args) -> PolicyBackend:
-    """The current PolicyBackend choice (policy/policy_backend.py). A
-    future real OpenVLA client only needs to implement the same
-    BasePolicy/PolicyBackend interface to become a third --policy-backend
-    option here."""
-    if args.policy_backend == "fastapi-dummy":
-        return FastAPIVLAPolicyClient(server_url=args.policy_server_url, timeout=args.policy_request_timeout)
+def create_local_dummy_policy(args) -> DummyOpenVLAPolicy:
     return DummyOpenVLAPolicy(
         max_step_size=args.max_step_size,
         position_tolerance=args.position_tolerance,
         carry_height=args.carry_height,
         grasp_z_offset=args.grasp_z_offset,
     )
+
+
+def create_policy_backend(args) -> PolicyBackend:
+    """The current PolicyBackend choice (policy/policy_backend.py).
+    --policy-backend real-vla is the adapter layer for a future real
+    OpenVLA/VLA model server -- RealVLAPolicyClient implements the same
+    BasePolicy/PolicyBackend interface, so this is the only function
+    that changes when a real server replaces
+    openvla_server_dummy/real_vla_compatible_server.py."""
+    if args.policy_backend == "fastapi-dummy":
+        return FastAPIVLAPolicyClient(server_url=args.policy_server_url, timeout=args.policy_request_timeout)
+    if args.policy_backend == "real-vla":
+        if args.real_vla_fallback_backend == "fastapi-dummy":
+            fallback_policy = FastAPIVLAPolicyClient(
+                server_url=args.policy_server_url, timeout=args.policy_request_timeout
+            )
+        elif args.real_vla_fallback_backend == "local-dummy":
+            fallback_policy = create_local_dummy_policy(args)
+        else:
+            fallback_policy = None
+        return RealVLAPolicyClient(config_path=resolve(args.real_vla_config), fallback_policy=fallback_policy)
+    return create_local_dummy_policy(args)
 
 
 def create_external_camera_backend(args) -> CameraBackend:
@@ -586,9 +609,19 @@ def run_dummy_openvla_policy(
     policy_backend_state = {
         "policy_backend": args.policy_backend,
         "policy_server_url": args.policy_server_url if args.policy_backend == "fastapi-dummy" else None,
+        "fallback_backend": None,
+        "fallback_used_count": 0,
         "avg_inference_latency_ms": None,
+        "avg_image_encoding_latency_ms": None,
+        "action_schema": None,
+        "model": None,
     }
+    if args.policy_backend == "real-vla":
+        policy_backend_state["policy_server_url"] = getattr(policy, "server_url", None)
+        policy_backend_state["fallback_backend"] = args.real_vla_fallback_backend
+        policy_backend_state["action_schema"] = (getattr(policy, "action_schema", {}) or {}).get("type")
     inference_latencies_ms = []
+    image_encoding_latencies_ms = []
 
     # Safety Pause/Resume state machine, owned by SafetySupervisor (see
     # safety/safety_supervisor.py) -- deliberately decoupled from
@@ -608,6 +641,11 @@ def run_dummy_openvla_policy(
             policy_backend_state["avg_inference_latency_ms"] = round(
                 sum(inference_latencies_ms) / len(inference_latencies_ms), 3
             )
+        if image_encoding_latencies_ms:
+            policy_backend_state["avg_image_encoding_latency_ms"] = round(
+                sum(image_encoding_latencies_ms) / len(image_encoding_latencies_ms), 3
+            )
+        policy_backend_state["fallback_used_count"] = getattr(policy, "fallback_used_count", 0)
         return {
             **state_dict,
             **wrist_refinement_state,
@@ -794,6 +832,11 @@ def run_dummy_openvla_policy(
         inference_latency_ms = policy_output_info.get("inference_latency_ms")
         if inference_latency_ms is not None:
             inference_latencies_ms.append(inference_latency_ms)
+        image_encoding_latency_ms = policy_output_info.get("image_encoding_latency_ms")
+        if image_encoding_latency_ms is not None:
+            image_encoding_latencies_ms.append(image_encoding_latency_ms)
+        if policy_output_info.get("model") is not None:
+            policy_backend_state["model"] = policy_output_info["model"]
 
         policy_observation_event = None
         if args.record_policy_observations:
@@ -801,9 +844,13 @@ def run_dummy_openvla_policy(
                 "policy_output": {
                     "action": policy_output.action,
                     "policy_backend": policy_output_info.get("policy_backend", args.policy_backend),
+                    "model": policy_output_info.get("model"),
                     "inference_latency_ms": inference_latency_ms,
+                    "image_encoding_latency_ms": image_encoding_latency_ms,
+                    "fallback_used": policy_output_info.get("fallback_used"),
                     "used_image_input": policy_output_info.get("used_image_input"),
                     "observation_source": policy_output_info.get("observation_source"),
+                    "action_postprocess": policy_output_info.get("action_postprocess"),
                 }
             }
             if observation_source == "wrist":
@@ -1037,6 +1084,25 @@ def main() -> None:
             print(str(exc))
             print("FAIL")
             return
+    elif args.policy_backend == "real-vla" and args.policy == "dummy-openvla":
+        try:
+            real_vla_health_client = RealVLAPolicyClient(config_path=resolve(args.real_vla_config))
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(str(exc))
+            print("FAIL")
+            return
+
+        print(f"policy_backend: real-vla ({real_vla_health_client.server_url})")
+        try:
+            health = real_vla_health_client.check_health()
+            print(f"Real VLA policy server health: {health}")
+        except RuntimeError as exc:
+            if args.real_vla_fallback_backend == "none":
+                print(str(exc))
+                print("FAIL")
+                return
+            print(f"Real VLA policy server unreachable: {exc}")
+            print(f"Continuing with --real-vla-fallback-backend={args.real_vla_fallback_backend} at runtime.")
 
     safety_gate = build_safety_gate(args, model_path)
 
@@ -1203,6 +1269,12 @@ def main() -> None:
             print(f"recorded_wrist_observation_steps: {final_state.get('recorded_wrist_observation_steps')}")
         if args.policy_backend == "fastapi-dummy":
             print(f"avg_inference_latency_ms: {final_state.get('avg_inference_latency_ms')}")
+        if args.policy_backend == "real-vla":
+            print(f"model: {final_state.get('model')}")
+            print(f"fallback_backend: {final_state.get('fallback_backend')}")
+            print(f"fallback_used_count: {final_state.get('fallback_used_count')}")
+            print(f"avg_inference_latency_ms: {final_state.get('avg_inference_latency_ms')}")
+            print(f"avg_image_encoding_latency_ms: {final_state.get('avg_image_encoding_latency_ms')}")
         if args.safety_mode != "off":
             print(f"safety_mode: {args.safety_mode}")
             print(f"safety_pause_count: {final_state.get('safety_pause_count', 0)}")
