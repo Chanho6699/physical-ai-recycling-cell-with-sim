@@ -1,0 +1,14 @@
+{
+  "camera_name": "panda_wrist_camera_v0",
+  "end_effector_link_index": 11,
+  "width": 320,
+  "height": 240,
+  "fov": 70.0,
+  "near": 0.01,
+  "far": 2.0,
+  "camera_local_position": [0.0, 0.0, 0.0],
+  "camera_forward_local": [0.0, 0.0, 1.0],
+  "camera_up_local": [0.0, -1.0, 0.0],
+  "save_depth_colormap": true,
+  "save_segmentation_mask": true
+}
