@@ -21,6 +21,16 @@ if the env var isn't set:
                          (skip any network call entirely)
   VLA_DEVICE             "cuda" | "cpu" (default: cuda if available, else cpu)
   VLA_DTYPE              a torch dtype name, e.g. "bfloat16" | "float16" | "float32"
+  VLA_ALLOW_VLM_FALLBACK "1" to allow _load_smolvla() to fall back to a plain
+                         transformers.AutoModelForImageTextToText load (e.g.
+                         HuggingFaceTB/SmolVLM2-500M-Video-Instruct) when none
+                         of the LeRobot SmolVLA policy import candidates match
+                         the installed LeRobot version. Default: disabled --
+                         that fallback downloads the VLM backbone SmolVLA is
+                         built on top of, NOT the SmolVLA action policy
+                         itself, which isn't useful for confirming the real
+                         SmolVLA import path and can be a large, unwanted
+                         download (see docs/smolvla_cloud_loading_spike.md).
 
 Import-time behavior: importing this module NEVER loads a model or
 downloads anything -- only load_model_once() does, mirroring
@@ -41,6 +51,7 @@ MODEL_ID_OR_PATH_ENV_VAR = "VLA_MODEL_ID_OR_PATH"
 LOCAL_FILES_ONLY_ENV_VAR = "VLA_LOCAL_FILES_ONLY"
 DEVICE_ENV_VAR = "VLA_DEVICE"
 DTYPE_ENV_VAR = "VLA_DTYPE"
+ALLOW_VLM_FALLBACK_ENV_VAR = "VLA_ALLOW_VLM_FALLBACK"
 
 DEFAULT_MODEL_FAMILY = "mock-action"
 DEFAULT_MODEL_ID_BY_FAMILY = {
@@ -97,6 +108,10 @@ def resolve_device() -> str:
 
 def resolve_dtype_name() -> str:
     return os.environ.get(DTYPE_ENV_VAR, DEFAULT_DTYPE_NAME)
+
+
+def resolve_allow_vlm_fallback() -> bool:
+    return os.environ.get(ALLOW_VLM_FALLBACK_ENV_VAR) == "1"
 
 
 def get_state() -> dict:
@@ -204,14 +219,18 @@ def _load_smolvla(model_id_or_path: str, local_files_only: bool) -> dict:
     """Best-effort: SmolVLA ships as a LeRobot policy checkpoint, so the
     LeRobot policy loader is tried first, across several plausible
     import paths (see _SMOLVLA_IMPORT_CANDIDATES -- LeRobot's package
-    layout has moved between releases). A plain transformers
-    AutoModelForImageTextToText load is tried as a fallback in case a
-    transformers-native mirror is used instead. Neither library is
-    pinned by this repo, so a missing/incompatible install -- or none
-    of the import candidates matching the installed LeRobot version --
-    is an expected, gracefully-handled outcome (model_status=
-    load_failed, with every import attempt recorded in the reason), not
-    a crash."""
+    layout has moved between releases).
+
+    If none of those import candidates match the installed LeRobot
+    version, the default behavior is to fail immediately with
+    model_status=load_failed -- NOT to fall back to a plain
+    transformers.AutoModelForImageTextToText load. That fallback
+    resolves to downloading the VLM backbone SmolVLA is built on top of
+    (e.g. HuggingFaceTB/SmolVLM2-500M-Video-Instruct), not the SmolVLA
+    action policy itself, which is a large, unwanted download for what
+    this spike is actually trying to confirm. Set
+    VLA_ALLOW_VLM_FALLBACK=1 to opt into that fallback path explicitly
+    (see docs/smolvla_cloud_loading_spike.md)."""
     try:
         import torch
     except ImportError as exc:
@@ -231,9 +250,22 @@ def _load_smolvla(model_id_or_path: str, local_files_only: bool) -> dict:
             model = model.to(device)
         except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
             return _fail(f"model_load_failed via {policy_class.__module__}.{policy_class.__name__} ({context}): {exc}")
+    elif not resolve_allow_vlm_fallback():
+        # Default path: none of the LeRobot import candidates worked,
+        # and the VLM fallback is disabled -- fail immediately instead
+        # of ever attempting a transformers/SmolVLM2 import or download.
+        tried = ", ".join(a["candidate"] for a in lerobot_attempts)
+        return _fail(
+            f"SmolVLA policy import failed; VLM fallback disabled -- tried [{tried}] (all failed). "
+            f"Set {ALLOW_VLM_FALLBACK_ENV_VAR}=1 to opt into the transformers/SmolVLM2 backbone fallback "
+            f"instead (not the SmolVLA action policy). {context}"
+        )
     else:
-        # None of the LeRobot import candidates worked -- fall back to
-        # a plain transformers load before giving up entirely.
+        # VLA_ALLOW_VLM_FALLBACK=1: none of the LeRobot import
+        # candidates worked -- fall back to a plain transformers load
+        # before giving up entirely. This downloads the VLM backbone
+        # SmolVLA is built on (e.g. HuggingFaceTB/SmolVLM2-500M-Video-Instruct),
+        # not the SmolVLA action policy -- opt-in only.
         try:
             from transformers import AutoModelForImageTextToText, AutoProcessor
         except ImportError as exc:

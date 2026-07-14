@@ -68,15 +68,14 @@ recommended default.
 2. **`POST /load_model`** -- the only thing that ever attempts a real
    SmolVLA load. `vla_server/model_loader.py` tries several LeRobot
    import paths in turn (`_SMOLVLA_IMPORT_CANDIDATES`, since LeRobot's
-   package layout has moved across releases), falling back to a plain
-   `transformers.AutoModelForImageTextToText` load if none of them
-   match the installed LeRobot version. Every failure mode is recorded
-   into `model_status`/`model_status_reason` instead of crashing the
-   server:
+   package layout has moved across releases). Every failure mode is
+   recorded into `model_status`/`model_status_reason` instead of
+   crashing the server:
 
    | `model_status_reason` mentions | Interpretation |
    |---|---|
-   | `missing_dependency` / `SmolVLA import path needs update` | `lerobot`/`transformers` isn't installed, or none of the tried import paths matched this LeRobot version -- see the notebook's section 4 import probe |
+   | `SmolVLA policy import failed; VLM fallback disabled` | None of the tried LeRobot import paths matched this LeRobot version, and `VLA_ALLOW_VLM_FALLBACK` is unset/`0` (the default) -- **no download was attempted at all**. Use the notebook's section 4b `pkgutil` probe to find the real installed module path and add it to `_SMOLVLA_IMPORT_CANDIDATES` |
+   | `missing_dependency` | `torch`/`lerobot` isn't installed (or, only when `VLA_ALLOW_VLM_FALLBACK=1`, `transformers` isn't installed either) |
    | a repo/model-not-found-style message | `VLA_MODEL_ID_OR_PATH` is wrong, private, or gated |
    | `CUDA out of memory` | Download and load actually worked -- this GPU tier just doesn't have enough VRAM |
    | anything else | Recorded verbatim; the reason string always includes `model_id_or_path`, `local_files_only`, `device`, `dtype` so the exact attempted configuration is visible |
@@ -85,6 +84,38 @@ recommended default.
    things** (same distinction as the OpenVLA spike): a `CUDA out of
    memory` failure means the download/import worked fine, it's a
    compute limit, not a data problem.
+
+   ### SmolVLA action policy vs. SmolVLM/VLM backbone -- not the same thing
+
+   **SmolVLA** (what this spike is actually trying to confirm) is a
+   LeRobot **action policy** -- it should load via a LeRobot policy
+   class such as `SmolVLAPolicy.from_pretrained(...)`, one of the
+   `_SMOLVLA_IMPORT_CANDIDATES` paths. **SmolVLM/SmolVLM2** (e.g.
+   `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`) is a generic **vision-
+   language backbone model** that SmolVLA happens to be built on top
+   of -- it can answer questions about an image, but it has no action
+   head and is not the thing this spike needs.
+
+   `vla_server/model_loader.py`'s `_load_smolvla()` used to fall back to
+   a plain `transformers.AutoModelForImageTextToText.from_pretrained(...)`
+   load whenever none of the LeRobot import candidates matched. In
+   practice this resolves to downloading the SmolVLM2 backbone (a
+   multi-GB download that can hang a Colab session) instead of the
+   actual SmolVLA action policy -- not useful for confirming SmolVLA's
+   real import path, and not what "loaded" should mean for this spike.
+
+   **This fallback is now disabled by default.** It only runs if
+   `VLA_ALLOW_VLM_FALLBACK=1` is set explicitly (the notebook's section
+   5 sets `VLA_ALLOW_VLM_FALLBACK=0` by default). With it left at `0`
+   (or unset), a failed LeRobot import goes straight to
+   `model_status=load_failed` with reason `SmolVLA policy import
+   failed; VLM fallback disabled` -- no SmolVLM2 download is ever
+   attempted. `/health` also reports the current setting as
+   `allow_vlm_fallback`. Only set `VLA_ALLOW_VLM_FALLBACK=1` if you
+   deliberately want to exercise the SmolVLM2 backbone fallback path
+   itself (e.g. to confirm the download/load machinery works), not as
+   part of confirming the real SmolVLA policy path -- use the
+   notebook's section 4b `pkgutil` probe for that instead.
 
 3. **`POST /predict`** with a dummy image -- if `model_status !=
    "loaded"`, returns the same structured `model_not_loaded` error

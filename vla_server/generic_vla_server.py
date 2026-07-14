@@ -137,6 +137,7 @@ def health():
         "model_status_reason": state["reason"],
         "model_id_or_path": model_loader.resolve_model_id_or_path(_MODEL_FAMILY, _BACKEND_CONFIG),
         "local_files_only": model_loader.resolve_local_files_only(),
+        "allow_vlm_fallback": model_loader.resolve_allow_vlm_fallback(),
         "adapter": type(_ADAPTER).__name__,
         "version": "v0",
     }
