@@ -2,13 +2,22 @@
 
 Normalizes SmolVLA's raw model output into this project's normalized
 7-DoF action ([dx, dy, dz, droll, dpitch, dyaw, gripper]). SmolVLA's
-actual raw output shape can vary depending on how it was loaded/called
-(a plain 7-number action, an {"action": [...]} dict, a chunked
-{"actions": [[...], [...], ...]} action-horizon dict, a numpy array, a
-torch tensor, ...) -- this adapter tries each of those shapes in turn
-rather than assuming one, and rejects (with a structured,
-fallback-triggering reason) anything it can't confidently interpret
-instead of guessing.
+actual raw output shape can vary depending on how it was loaded/called:
+
+  - a plain 7-number action: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+  - a dict with an "action" key wrapping any of the shapes below
+  - a dict with an "actions" key (chunked/action-horizon policies)
+  - a chunked action with no dict wrapper: [T, 7]
+  - a batched chunk: [B, T, 7] (or [B, 7])
+  - any of the above as a numpy array or torch tensor instead of a
+    plain list/tuple
+
+This adapter tries each of those shapes in turn (via a small bounded
+recursive "peel one dimension, select by step_index" pass) rather than
+assuming one, and rejects -- with a structured, fallback-triggering
+reason plus a `raw_output_summary` (type/shape, never the full tensor)
+-- anything it can't confidently resolve down to a flat 7-number
+vector instead of guessing.
 """
 
 import math
@@ -48,6 +57,8 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
             "phase": policy_input_dict.get("phase"),
         }
 
+    MAX_PEEL_DEPTH = 4
+
     def normalize_model_output(self, raw_output: Any, context: dict) -> dict:
         step_index = context.get("step_index", 0)
         phase = context.get("phase") or "move_to_object"
@@ -56,7 +67,7 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
             raw_action = self._extract_raw_action(raw_output, step_index)
             action, debug = self._validate_and_clip(raw_action)
         except ValueError as exc:
-            return self._reject(phase, str(exc))
+            return self._reject(phase, str(exc), raw_output)
 
         return {
             "action": action,
@@ -71,34 +82,59 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
         }
 
     def _extract_raw_action(self, raw_output: Any, step_index: int) -> list:
-        """Handles: a plain 7-number sequence; a {"action": [...]} dict;
-        a chunked {"actions": [[...], ...]} dict (action-horizon
-        policies) selected by step_index; a bare chunked list of lists
-        (same selection); numpy arrays/torch tensors anywhere in that
-        structure. Raises ValueError (never crashes) for anything else."""
+        """Unwraps a {"action": ...}/{"actions": ...} dict first (if
+        present), then peels arbitrarily-nested batch/chunk dimensions
+        via _peel_to_vector() -- see module docstring for the shapes
+        this covers. Raises ValueError (never crashes) for anything it
+        can't resolve down to a flat 7-number vector."""
         value = self._to_plain(raw_output)
 
         if isinstance(value, dict):
             if "action" in value:
-                value = self._to_plain(value["action"])
+                value = value["action"]
             elif "actions" in value:
-                chunk = self._to_plain(value["actions"])
-                if not chunk:
-                    raise ValueError("smolvla_raw_output_empty_actions_chunk")
-                index = min(max(step_index, 0), len(chunk) - 1)
-                value = self._to_plain(chunk[index])
+                value = value["actions"]
             else:
                 raise ValueError(f"smolvla_raw_output_missing_action_field: keys={list(value.keys())}")
 
-        if isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], (list, tuple)):
-            # A bare chunk of actions with no dict wrapper.
-            index = min(max(step_index, 0), len(value) - 1)
-            value = self._to_plain(value[index])
+        return self._peel_to_vector(value, step_index, depth=0)
 
-        if not isinstance(value, (list, tuple)):
-            raise ValueError(f"smolvla_raw_output_unrecognized_shape: {type(value)!r}")
+    def _peel_to_vector(self, value: Any, step_index: int, depth: int) -> list:
+        """Recursively selects one nesting level at a time (batch
+        dim, then chunk/time dim, ...) using step_index (clamped) as
+        the selector at every level, until a flat 7-number vector is
+        reached or MAX_PEEL_DEPTH is exceeded. This is a deliberate
+        simplification -- without explicit shape metadata from the
+        model, [B, 7] and [T, 7] are indistinguishable, so both are
+        resolved the same way (index by step_index). A real
+        integration that knows the exact SmolVLA output shape should
+        prefer indexing it directly rather than relying on this."""
+        value = self._to_plain(value)
 
-        return list(value)
+        if isinstance(value, (list, tuple)):
+            if len(value) == 7 and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
+                return list(value)
+
+            if depth >= self.MAX_PEEL_DEPTH:
+                raise ValueError(
+                    f"smolvla_raw_output_shape_too_deep: exceeded {self.MAX_PEEL_DEPTH} nesting levels "
+                    f"without reaching a 7-number vector; last shape={self._shape_of(value)}"
+                )
+            if len(value) == 0:
+                raise ValueError("smolvla_raw_output_empty_sequence")
+
+            first = self._to_plain(value[0])
+            if isinstance(first, (list, tuple)):
+                index = min(max(step_index, 0), len(value) - 1)
+                return self._peel_to_vector(value[index], step_index, depth + 1)
+
+            # A flat sequence that isn't length 7 -- not interpretable.
+            raise ValueError(
+                f"smolvla_raw_output_wrong_length: expected 7 numbers ([dx, dy, dz, droll, dpitch, dyaw, gripper]) "
+                f"at nesting depth {depth}, got length {len(value)}: {value}"
+            )
+
+        raise ValueError(f"smolvla_raw_output_unrecognized_shape: {type(value)!r}")
 
     @staticmethod
     def _to_plain(value: Any) -> Any:
@@ -107,6 +143,24 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
         if hasattr(value, "tolist"):  # numpy array
             value = value.tolist()
         return value
+
+    @classmethod
+    def _shape_of(cls, value: Any):
+        if isinstance(value, (list, tuple)):
+            return [len(value)] + (cls._shape_of(value[0]) if len(value) > 0 else [])
+        return []
+
+    def _summarize_raw_output(self, raw_output: Any) -> dict:
+        """Cheap, safe-to-log summary of an unrecognized raw output --
+        never dumps the full tensor/array contents."""
+        summary = {"type": type(raw_output).__name__}
+        if hasattr(raw_output, "shape"):
+            summary["shape"] = list(raw_output.shape)
+        elif isinstance(raw_output, dict):
+            summary["dict_keys"] = list(raw_output.keys())
+        elif isinstance(raw_output, (list, tuple)):
+            summary["shape"] = self._shape_of(raw_output)
+        return summary
 
     def _validate_and_clip(self, raw_action: list):
         if len(raw_action) != 7:
@@ -151,7 +205,7 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
         }
         return action, debug
 
-    def _reject(self, phase: str, reason: str) -> dict:
+    def _reject(self, phase: str, reason: str, raw_output: Any = None) -> dict:
         return {
             "action": None,
             "phase": phase,
@@ -160,6 +214,7 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
                 "model_family": self.model_family,
                 "adapter_used": "SmolVLAActionAdapter",
                 "raw_model_output_available": True,
+                "raw_output_summary": self._summarize_raw_output(raw_output),
                 "project_action_available": False,
                 "reason": reason,
             },

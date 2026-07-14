@@ -160,32 +160,90 @@ def _load_mock_action() -> dict:
     return get_state()
 
 
+# Tried in order -- LeRobot has reorganized its policies package layout
+# across versions, so more than one import path is plausible depending
+# on which LeRobot release is installed. Each entry is
+# "module.path:ClassName"; _try_import_smolvla_policy_class() records
+# exactly which candidates were tried and why each one failed, so a
+# "SmolVLA import path needs update" failure is actionable instead of
+# a bare ImportError.
+_SMOLVLA_IMPORT_CANDIDATES = [
+    "lerobot.common.policies.smolvla.modeling_smolvla:SmolVLAPolicy",
+    "lerobot.policies.smolvla.modeling_smolvla:SmolVLAPolicy",
+    "lerobot.common.policies.smolvla.smolvla:SmolVLAPolicy",
+]
+
+
+def _try_import_smolvla_policy_class():
+    """Never raises. Returns (policy_class_or_None, attempts) where
+    attempts is a list of {"candidate": str, "ok": bool, "error": str}
+    dicts -- one per import path tried, in order, stopping at the
+    first success."""
+    attempts = []
+    for candidate in _SMOLVLA_IMPORT_CANDIDATES:
+        module_path, _, class_name = candidate.partition(":")
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            policy_class = getattr(module, class_name)
+        except Exception as exc:  # noqa: BLE001 -- record and try the next candidate
+            attempts.append({"candidate": candidate, "ok": False, "error": str(exc)})
+            continue
+        attempts.append({"candidate": candidate, "ok": True, "error": None})
+        return policy_class, attempts
+    return None, attempts
+
+
+def _context_suffix(model_id_or_path: str, local_files_only: bool) -> str:
+    return (
+        f"model_id_or_path={model_id_or_path}, local_files_only={local_files_only}, "
+        f"device={resolve_device()}, dtype={resolve_dtype_name()}"
+    )
+
+
 def _load_smolvla(model_id_or_path: str, local_files_only: bool) -> dict:
-    """Best-effort: SmolVLA ships as a LeRobot policy checkpoint, so
-    the LeRobot policy loader is tried first (matches how SmolVLA is
-    actually distributed); a plain transformers AutoModel load is
-    tried as a fallback in case a transformers-native mirror is used
-    instead. Neither library is pinned by this repo, so a missing/
-    incompatible install is an expected, gracefully-handled outcome,
-    not a crash."""
+    """Best-effort: SmolVLA ships as a LeRobot policy checkpoint, so the
+    LeRobot policy loader is tried first, across several plausible
+    import paths (see _SMOLVLA_IMPORT_CANDIDATES -- LeRobot's package
+    layout has moved between releases). A plain transformers
+    AutoModelForImageTextToText load is tried as a fallback in case a
+    transformers-native mirror is used instead. Neither library is
+    pinned by this repo, so a missing/incompatible install -- or none
+    of the import candidates matching the installed LeRobot version --
+    is an expected, gracefully-handled outcome (model_status=
+    load_failed, with every import attempt recorded in the reason), not
+    a crash."""
     try:
         import torch
     except ImportError as exc:
-        return _fail(f"missing_dependency: {exc}")
+        return _fail(f"missing_dependency: torch not installed ({exc}). {_context_suffix(model_id_or_path, local_files_only)}")
 
     dtype_name = resolve_dtype_name()
     dtype = getattr(torch, dtype_name, torch.float32)
     device = resolve_device()
+    context = _context_suffix(model_id_or_path, local_files_only)
 
+    policy_class, lerobot_attempts = _try_import_smolvla_policy_class()
     processor = None
-    try:
+
+    if policy_class is not None:
         try:
-            from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-
-            model = SmolVLAPolicy.from_pretrained(model_id_or_path, local_files_only=local_files_only)
-        except ImportError:
+            model = policy_class.from_pretrained(model_id_or_path, local_files_only=local_files_only)
+            model = model.to(device)
+        except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
+            return _fail(f"model_load_failed via {policy_class.__module__}.{policy_class.__name__} ({context}): {exc}")
+    else:
+        # None of the LeRobot import candidates worked -- fall back to
+        # a plain transformers load before giving up entirely.
+        try:
             from transformers import AutoModelForImageTextToText, AutoProcessor
+        except ImportError as exc:
+            tried = ", ".join(a["candidate"] for a in lerobot_attempts)
+            return _fail(
+                f"missing_dependency: SmolVLA import path needs update -- tried [{tried}] (all failed) "
+                f"and transformers fallback also unavailable ({exc}). {context}"
+            )
 
+        try:
             processor = AutoProcessor.from_pretrained(
                 model_id_or_path, local_files_only=local_files_only, trust_remote_code=True
             )
@@ -194,12 +252,13 @@ def _load_smolvla(model_id_or_path: str, local_files_only: bool) -> dict:
                 local_files_only=local_files_only,
                 torch_dtype=dtype,
                 trust_remote_code=True,
+            ).to(device)
+        except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
+            tried = ", ".join(a["candidate"] for a in lerobot_attempts)
+            return _fail(
+                f"model_load_failed via transformers.AutoModelForImageTextToText fallback "
+                f"(LeRobot candidates tried and failed: [{tried}]; {context}): {exc}"
             )
-        model = model.to(device)
-    except ImportError as exc:
-        return _fail(f"missing_dependency: {exc}")
-    except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
-        return _fail(f"model_load_failed ({model_id_or_path}, local_files_only={local_files_only}): {exc}")
 
     with _lock:
         _state["model"] = model
@@ -221,16 +280,18 @@ def _load_openvla(model_id_or_path: str, local_files_only: bool) -> dict:
         import torch
         from transformers import AutoModelForVision2Seq, AutoProcessor
     except ImportError as exc:
-        return _fail(f"missing_dependency: {exc}")
+        return _fail(f"missing_dependency: {exc}. {_context_suffix(model_id_or_path, local_files_only)}")
 
     if not torch.cuda.is_available():
         return _fail(
             "no_cuda_gpu_available (openvla needs a CUDA GPU runtime -- see "
-            "docs/colab_vla_server_spike.md for the Colab-specific experiment for this family)"
+            f"docs/colab_vla_server_spike.md for the Colab-specific experiment for this family). "
+            f"{_context_suffix(model_id_or_path, local_files_only)}"
         )
 
     dtype_name = resolve_dtype_name()
     dtype = getattr(torch, dtype_name, torch.bfloat16)
+    context = _context_suffix(model_id_or_path, local_files_only)
 
     try:
         processor = AutoProcessor.from_pretrained(
@@ -243,7 +304,7 @@ def _load_openvla(model_id_or_path: str, local_files_only: bool) -> dict:
             trust_remote_code=True,
         ).to("cuda")
     except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
-        return _fail(f"model_load_failed ({model_id_or_path}, local_files_only={local_files_only}): {exc}")
+        return _fail(f"model_load_failed ({context}): {exc}")
 
     with _lock:
         _state["model"] = model
@@ -284,24 +345,41 @@ def run_inference(model_family: str, model_input: dict) -> Any:
 
 
 def _run_smolvla_inference(model, processor, model_input: dict) -> Any:
+    """Tries each plausible calling convention for the loaded model in
+    turn, raising a RuntimeError naming exactly which ones were tried
+    if none apply -- generic_vla_server.py turns that into a structured
+    inference_failed error rather than a crash, and the reason string
+    is specific enough to say what needs updating."""
     import torch
+
+    batch = {
+        "observation.image": model_input.get("image"),
+        "observation.state": model_input.get("robot_state"),
+        "task": model_input.get("instruction"),
+    }
 
     with torch.no_grad():
         if hasattr(model, "select_action"):
             # LeRobot policy interface: select_action(batch) -> action tensor/dict.
-            batch = {
-                "observation.image": model_input.get("image"),
-                "observation.state": model_input.get("robot_state"),
-                "task": model_input.get("instruction"),
-            }
             return model.select_action(batch)
 
-        # transformers-style processor+generate fallback.
-        dtype = getattr(torch, resolve_dtype_name(), torch.float32)
-        inputs = processor(model_input.get("instruction", ""), model_input.get("image")).to(
-            resolve_device(), dtype=dtype
-        )
-        return model.generate(**inputs)
+        if hasattr(model, "predict_action"):
+            # Some LeRobot-adjacent policies expose predict_action(batch) instead.
+            return model.predict_action(batch)
+
+        if processor is not None and hasattr(model, "generate"):
+            # transformers-style processor+generate fallback.
+            dtype = getattr(torch, resolve_dtype_name(), torch.float32)
+            inputs = processor(model_input.get("instruction", ""), model_input.get("image")).to(
+                resolve_device(), dtype=dtype
+            )
+            return model.generate(**inputs)
+
+    raise RuntimeError(
+        f"Loaded SmolVLA model ({type(model).__module__}.{type(model).__name__}) has none of the expected "
+        "inference methods (select_action, predict_action, generate) -- the model_loader.py dispatch needs "
+        "updating for this model's actual API."
+    )
 
 
 def _run_openvla_inference(model, processor, model_input: dict) -> Any:

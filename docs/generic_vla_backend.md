@@ -183,3 +183,13 @@ python -m benchmark.run_full_recycling_cell_demo \
   --image-path data/test_images/recyclable_scene.jpg \
   --headless
 ```
+
+## Cloud loading
+
+Running `model_family="smolvla"` against an actual checkpoint (rather
+than just exercising the graceful-failure path locally) needs a GPU
+this project's dev machine doesn't have -- see
+[docs/smolvla_cloud_loading_spike.md](smolvla_cloud_loading_spike.md)
+and `notebooks/colab_generic_vla_smolvla_spike_v0.ipynb` for running
+this exact server in a Colab GPU runtime and connecting to it from
+`RealVLAPolicyClient` over a cloudflared tunnel.
