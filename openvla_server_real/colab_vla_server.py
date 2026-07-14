@@ -79,8 +79,10 @@ from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.policy_types import PolicyInput
 
 SERVER_MODE_ENV_VAR = "COLAB_VLA_SERVER_MODE"
-MODEL_NAME_ENV_VAR = "COLAB_VLA_MODEL_NAME"
-DEFAULT_MODEL_NAME = "openvla/openvla-7b"
+MODEL_PATH_ENV_VAR = "OPENVLA_MODEL_PATH"
+MODEL_ID_ENV_VAR = "OPENVLA_MODEL_ID"
+LOCAL_FILES_ONLY_ENV_VAR = "OPENVLA_LOCAL_FILES_ONLY"
+DEFAULT_MODEL_ID = "openvla/openvla-7b"
 VALID_SERVER_MODES = ("health-only", "mock-action", "openvla-dryrun")
 DEFAULT_SERVER_MODE = "health-only"
 VALID_MODEL_STATUSES = ("not_loaded", "loading", "loaded", "load_failed")
@@ -94,6 +96,23 @@ def _resolve_server_mode() -> str:
             "(\"openvla-direct\" is intentionally not implemented)."
         )
     return mode
+
+
+def resolve_model_id_or_path() -> str:
+    """OPENVLA_MODEL_PATH (a local directory -- e.g. a Google Drive
+    mount path -- takes priority since it means "use exactly this,
+    don't touch the network) wins over OPENVLA_MODEL_ID (a HF Hub repo
+    id); falling back to DEFAULT_MODEL_ID if neither is set. Cheap, safe
+    to call from /health -- just reads env vars, never touches disk or
+    network."""
+    model_path = os.environ.get(MODEL_PATH_ENV_VAR)
+    if model_path:
+        return model_path
+    return os.environ.get(MODEL_ID_ENV_VAR, DEFAULT_MODEL_ID)
+
+
+def resolve_local_files_only() -> bool:
+    return os.environ.get(LOCAL_FILES_ONLY_ENV_VAR) == "1"
 
 
 SERVER_MODE = _resolve_server_mode()
@@ -169,16 +188,22 @@ def load_openvla_model_once() -> dict:
             )
         return dict(_model_state)
 
-    model_name = os.environ.get(MODEL_NAME_ENV_VAR, DEFAULT_MODEL_NAME)
+    model_id_or_path = resolve_model_id_or_path()
+    local_files_only = resolve_local_files_only()
     try:
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_id_or_path, local_files_only=local_files_only, trust_remote_code=True
+        )
         model = AutoModelForVision2Seq.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
+            model_id_or_path,
+            local_files_only=local_files_only,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
         ).to("cuda")
     except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
         with _model_lock:
             _model_state["status"] = "load_failed"
-            _model_state["reason"] = f"model_load_failed: {exc}"
+            _model_state["reason"] = f"model_load_failed ({model_id_or_path}, local_files_only={local_files_only}): {exc}"
         return dict(_model_state)
 
     with _model_lock:
@@ -253,6 +278,8 @@ def health():
         "server_mode": SERVER_MODE,
         "model_status": _model_state["status"],
         "model_status_reason": _model_state.get("reason"),
+        "model_id_or_path": resolve_model_id_or_path(),
+        "local_files_only": resolve_local_files_only(),
         "version": "v0",
     }
 

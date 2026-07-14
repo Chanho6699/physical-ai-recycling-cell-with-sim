@@ -122,6 +122,29 @@ failure) reports back its final state instead of retrying. `model_status`
 is one of `not_loaded` (never requested) / `loading` / `loaded` /
 `load_failed` (attempted and failed -- see `model_status_reason`).
 
+**Which model gets loaded** is controlled by environment variables,
+read fresh every time (by `/health` and by `/load_model`), never
+hardcoded:
+
+```text
+OPENVLA_MODEL_PATH        a local directory (e.g. a Google Drive mount
+                          path like /content/drive/MyDrive/openvla-7b)
+                          -- wins over OPENVLA_MODEL_ID if set
+OPENVLA_MODEL_ID          a Hugging Face Hub repo id (default
+                          "openvla/openvla-7b") -- used only if
+                          OPENVLA_MODEL_PATH is not set
+OPENVLA_LOCAL_FILES_ONLY  "1" to pass local_files_only=True to both
+                          AutoProcessor.from_pretrained() and
+                          AutoModelForVision2Seq.from_pretrained()
+                          (skip any network call entirely); anything
+                          else (including unset) means False
+```
+
+`/health` always reports the currently-resolved `model_id_or_path` and
+`local_files_only` -- what `/load_model` would use right now -- so you
+can confirm the env vars took effect before triggering an actual
+(potentially multi-GB, multi-minute) load.
+
 If a Colab GPU is unavailable, shard downloads stall, or VRAM runs out,
 `/load_model` reports `model_status=load_failed` with a reason and the
 server keeps running -- this is exactly the environment-limitation
