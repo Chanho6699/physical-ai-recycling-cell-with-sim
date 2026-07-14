@@ -19,11 +19,20 @@ Non-goals, deliberately:
     delta_ee_7dof action without a verified, dedicated adapter. Until
     one exists, openvla-dryrun surfaces the raw output for inspection
     and returns action_adapter_required instead of a fabricated action.
+  - Importing this module NEVER downloads or loads OpenVLA, even in
+    openvla-dryrun mode -- a multi-GB model download stalling or
+    failing must not prevent the FastAPI app (and /health with it)
+    from coming up at all. Model loading only ever happens lazily,
+    triggered by an explicit POST /load_model (or you could wire the
+    first /predict call to trigger it too, but that would make the
+    first request after startup unpredictably slow -- this repo always
+    requires the explicit call so a caller can choose when to pay that
+    cost).
 
 Three server modes (set via the COLAB_VLA_SERVER_MODE env var, default
 "health-only"):
 
-  health-only     No model loaded. /health reports model_status=
+  health-only     No model loaded, ever. /health reports model_status=
                   not_loaded. /predict always fails with
                   model_not_loaded (503) -- exists purely to validate
                   that the tunnel/HTTP plumbing works end to end before
@@ -34,19 +43,21 @@ Three server modes (set via the COLAB_VLA_SERVER_MODE env var, default
                   deterministic, safe 7-DoF action. This is what
                   RealVLAPolicyClient/probe_colab_vla_server.py should
                   be tested against first.
-  openvla-dryrun  Best-effort attempt to load a real OpenVLA model
-                  (only if torch+transformers+a CUDA GPU are all
-                  available -- never required, never auto-installed).
-                  If loading fails for any reason (no GPU in this
-                  Colab runtime, out of VRAM, missing dependency, model
-                  download failure, ...), that is recorded as an
-                  environment limitation (model_status=not_loaded,
+  openvla-dryrun  App import/startup never touches OpenVLA. A real
+                  model load is only attempted when POST /load_model
+                  is called (see load_openvla_model_once()) -- only if
+                  torch+transformers+a CUDA GPU are all available
+                  (never required, never auto-installed). If loading
+                  fails for any reason (no GPU in this Colab runtime,
+                  out of VRAM, missing dependency, model download
+                  stalling/failing, ...), that is recorded as an
+                  environment limitation (model_status=load_failed,
                   model_status_reason=...), not a crash, and /predict
-                  responds action_adapter_required so the local client
-                  falls back. If the model does load, /predict returns
-                  the raw model output for inspection but still does
-                  NOT return an executable action -- see module
-                  docstring above.
+                  keeps responding model_not_loaded/action_adapter_required
+                  so the local client falls back. If the model does
+                  load, /predict returns the raw model output for
+                  inspection but still does NOT return an executable
+                  action -- see module docstring above.
 
 "openvla-direct" (a mode that would apply raw OpenVLA output straight
 to the robot) is intentionally not implemented.
@@ -55,6 +66,7 @@ to the robot) is intentionally not implemented.
 import base64
 import io
 import os
+import threading
 import time
 from typing import List, Optional
 
@@ -71,6 +83,7 @@ MODEL_NAME_ENV_VAR = "COLAB_VLA_MODEL_NAME"
 DEFAULT_MODEL_NAME = "openvla/openvla-7b"
 VALID_SERVER_MODES = ("health-only", "mock-action", "openvla-dryrun")
 DEFAULT_SERVER_MODE = "health-only"
+VALID_MODEL_STATUSES = ("not_loaded", "loading", "loaded", "load_failed")
 
 
 def _resolve_server_mode() -> str:
@@ -89,54 +102,91 @@ app = FastAPI(title=f"Colab VLA Server Spike v0 [{SERVER_MODE}]")
 
 _mock_policy = DummyOpenVLAPolicy() if SERVER_MODE == "mock-action" else None
 
-_model_state = {"status": "not_loaded", "reason": "server_mode is not openvla-dryrun"}
+# Lazy OpenVLA load state. Import/startup NEVER transitions this out of
+# "not_loaded" -- only an explicit load_openvla_model_once() call
+# (via POST /load_model) does. _model_lock only guards the short
+# status-transition bookkeeping, never the (possibly multi-minute)
+# download/load itself, so /health stays responsive throughout.
+_model_state = {"status": "not_loaded", "reason": "model load has not been requested"}
+_model_lock = threading.Lock()
 _openvla_model = None
 _openvla_processor = None
 
 
-def _try_load_openvla_model() -> None:
-    """Best-effort, never raises. Any failure (missing torch/
-    transformers, no CUDA GPU, OOM, model download failure, ...) is
-    recorded in _model_state as an environment limitation, not raised
-    as an error -- this is what lets /health and /predict report
-    model_status=not_loaded cleanly instead of the server crashing on
-    import or on startup."""
+def get_openvla_environment_report() -> dict:
+    """Cheap, import-safe check of what's available for openvla-dryrun
+    (torch/transformers importability, CUDA availability) without
+    loading any model or downloading anything. Safe to call from
+    /health or anywhere else that must stay fast."""
+    report = {"torch_installed": False, "transformers_installed": False, "cuda_available": False}
+    try:
+        import torch
+
+        report["torch_installed"] = True
+        report["cuda_available"] = bool(torch.cuda.is_available())
+    except ImportError:
+        pass
+    try:
+        import transformers  # noqa: F401
+
+        report["transformers_installed"] = True
+    except ImportError:
+        pass
+    return report
+
+
+def load_openvla_model_once() -> dict:
+    """Idempotent and thread-safe: the first caller actually attempts
+    the load (import torch/transformers, then download+load the model
+    onto the GPU); any concurrent/later caller just observes whatever
+    state that first attempt reached (or is still reaching) instead of
+    starting a second redundant download. Never raises -- every
+    failure mode is recorded into _model_state and returned as a plain
+    dict instead."""
     global _openvla_model, _openvla_processor
 
-    _model_state["status"] = "loading"
+    with _model_lock:
+        if _model_state["status"] in ("loading", "loaded"):
+            return dict(_model_state)
+        _model_state["status"] = "loading"
+        _model_state["reason"] = None
+
     try:
         import torch
         from transformers import AutoModelForVision2Seq, AutoProcessor
     except ImportError as exc:
-        _model_state["status"] = "not_loaded"
-        _model_state["reason"] = f"missing_dependency: {exc}"
-        return
+        with _model_lock:
+            _model_state["status"] = "load_failed"
+            _model_state["reason"] = f"missing_dependency: {exc}"
+        return dict(_model_state)
 
     if not torch.cuda.is_available():
-        _model_state["status"] = "not_loaded"
-        _model_state["reason"] = (
-            "no_cuda_gpu_available (openvla-dryrun needs a Colab GPU runtime: "
-            "Runtime > Change runtime type > T4 GPU or better)"
-        )
-        return
+        with _model_lock:
+            _model_state["status"] = "load_failed"
+            _model_state["reason"] = (
+                "no_cuda_gpu_available (openvla-dryrun needs a Colab GPU runtime: "
+                "Runtime > Change runtime type > T4 GPU or better)"
+            )
+        return dict(_model_state)
 
     model_name = os.environ.get(MODEL_NAME_ENV_VAR, DEFAULT_MODEL_NAME)
     try:
-        _openvla_processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        _openvla_model = AutoModelForVision2Seq.from_pretrained(
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
         ).to("cuda")
+    except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
+        with _model_lock:
+            _model_state["status"] = "load_failed"
+            _model_state["reason"] = f"model_load_failed: {exc}"
+        return dict(_model_state)
+
+    with _model_lock:
+        _openvla_model = model
+        _openvla_processor = processor
         _model_state["status"] = "loaded"
         _model_state["reason"] = None
-    except Exception as exc:  # noqa: BLE001 -- any load failure is an environment limitation, never a crash
-        _model_state["status"] = "not_loaded"
-        _model_state["reason"] = f"model_load_failed: {exc}"
-        _openvla_model = None
-        _openvla_processor = None
-
-
-if SERVER_MODE == "openvla-dryrun":
-    _try_load_openvla_model()
+    return dict(_model_state)
 
 
 class ImagePayload(BaseModel):
@@ -166,7 +216,7 @@ class PredictResponse(BaseModel):
     info: dict = {}
 
 
-def _decode_image(image_payload: Optional[ImagePayload]) -> Optional[np.ndarray]:
+def decode_request_image(image_payload: Optional[ImagePayload]) -> Optional[np.ndarray]:
     if image_payload is None:
         return None
     image_bytes = base64.b64decode(image_payload.data)
@@ -182,6 +232,20 @@ def _to_jsonable(value):
     return value
 
 
+def run_openvla_dryrun_inference(instruction: str, image_array: np.ndarray) -> dict:
+    """Runs one real OpenVLA forward pass against the already-loaded
+    model/processor and returns the raw output, converted to
+    JSON-safe types. Never converted into a delta_ee_7dof action here
+    -- see module docstring. Raises RuntimeError on inference failure;
+    callers report that as a structured error rather than a 500."""
+    import torch
+
+    pil_image = Image.fromarray(image_array)
+    inputs = _openvla_processor(instruction, pil_image).to("cuda", dtype=torch.bfloat16)
+    raw_output = _openvla_model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+    return _to_jsonable(raw_output)
+
+
 @app.get("/health")
 def health():
     return {
@@ -191,6 +255,32 @@ def health():
         "model_status_reason": _model_state.get("reason"),
         "version": "v0",
     }
+
+
+@app.post("/load_model")
+def load_model():
+    """Explicitly triggers the (only ever lazy) OpenVLA download/load.
+    Never attempted at import time or on any other endpoint -- see
+    module docstring for why. Safe to call more than once: an
+    in-progress or already-finished load is reported back as-is
+    instead of being restarted."""
+    if SERVER_MODE != "openvla-dryrun":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_server_mode",
+                "server_mode": SERVER_MODE,
+                "reason": "/load_model is only meaningful when COLAB_VLA_SERVER_MODE=openvla-dryrun.",
+            },
+        )
+
+    with _model_lock:
+        current_status = _model_state["status"]
+    if current_status in ("loading", "loaded"):
+        return {"model_status": current_status, "model_status_reason": _model_state.get("reason")}
+
+    result = load_openvla_model_once()
+    return {"model_status": result["status"], "model_status_reason": result.get("reason")}
 
 
 @app.post("/reset")
@@ -218,7 +308,7 @@ def predict(req: PredictRequest):
         )
 
     if SERVER_MODE == "mock-action":
-        image_array = _decode_image(req.image)
+        image_array = decode_request_image(req.image)
         if req.phase is not None:
             _mock_policy.phase = req.phase
 
@@ -256,14 +346,15 @@ def predict(req: PredictRequest):
         raise HTTPException(
             status_code=503,
             detail={
-                "error": "action_adapter_required",
+                "error": "model_not_loaded",
                 "server_mode": SERVER_MODE,
                 "model_status": _model_state["status"],
-                "reason": _model_state.get("reason") or "OpenVLA model is not loaded in this Colab runtime.",
+                "reason": _model_state.get("reason")
+                or "Model has not been loaded yet -- call POST /load_model first.",
             },
         )
 
-    image_array = _decode_image(req.image)
+    image_array = decode_request_image(req.image)
     if image_array is None:
         raise HTTPException(
             status_code=400,
@@ -271,11 +362,7 @@ def predict(req: PredictRequest):
         )
 
     try:
-        import torch
-
-        pil_image = Image.fromarray(image_array)
-        inputs = _openvla_processor(req.instruction, pil_image).to("cuda", dtype=torch.bfloat16)
-        raw_output = _openvla_model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+        raw_output = run_openvla_dryrun_inference(req.instruction, image_array)
     except Exception as exc:  # noqa: BLE001 -- inference failure is reported, not a 500 crash
         raise HTTPException(
             status_code=503,
@@ -300,7 +387,7 @@ def predict(req: PredictRequest):
             "server_mode": SERVER_MODE,
             "model_status": "loaded",
             "raw_model_output_available": True,
-            "raw_model_output": _to_jsonable(raw_output),
+            "raw_model_output": raw_output,
             "project_action_available": False,
             "reason": "action_adapter_required",
             "server_inference_ms": round(server_inference_ms, 3),

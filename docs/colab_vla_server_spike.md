@@ -81,13 +81,12 @@ bar than the last:
    `real-vla-compatible-mock` already share) to return a deterministic,
    safe 7-DoF action. **This is the actual success bar for this spike.**
 3. **`openvla-dryrun`** -- best-effort attempt to load a real OpenVLA
-   model (only if torch + transformers + a CUDA GPU are all present in
-   the Colab runtime; nothing is auto-installed). Any failure (no GPU,
-   OOM, missing dependency, download failure) is recorded as
-   `model_status=not_loaded` with a `model_status_reason`, never a
-   crash. If the model does load, `/predict` returns the raw model
-   output for inspection but **still does not return an executable
-   action** -- `project_action_available=false`,
+   model, but **only when you explicitly ask for it**. Any failure (no
+   GPU, OOM, missing dependency, download stalling/failing) is
+   recorded as `model_status=load_failed` with a `model_status_reason`,
+   never a crash. If the model does load, `/predict` returns the raw
+   model output for inspection but **still does not return an
+   executable action** -- `project_action_available=false`,
    `reason=action_adapter_required`. OpenVLA's own action space/
    normalization has not been verified against this project's
    `delta_ee_7dof` schema, so it is never auto-converted and applied.
@@ -95,13 +94,57 @@ bar than the last:
 `openvla-direct` (a mode that would hand raw OpenVLA output straight to
 the robot) is intentionally **not implemented**.
 
+### Lazy model loading (`openvla-dryrun` only)
+
+**Importing this module -- or starting the server in `openvla-dryrun`
+mode -- never downloads or loads OpenVLA.** Importing/starting always
+finishes in well under a second, and `/health` is usable immediately,
+before any model load is ever attempted. This matters because an
+OpenVLA checkpoint is several GB, and a shard download stalling (slow
+Colab network, revoked GPU mid-download, ...) must never prevent the
+FastAPI app itself from coming up -- otherwise you can't even reach
+`/health` to tell what went wrong.
+
+Model loading only happens when something explicitly calls
+`POST /load_model`:
+
+```text
+GET  /health        always instant -- reports model_status without loading anything
+POST /load_model    the ONLY thing that ever triggers a real OpenVLA download/load
+POST /predict       (openvla-dryrun) uses whatever /load_model already produced;
+                     never triggers a load itself
+```
+
+`/load_model` is idempotent and safe to call more than once: an
+in-progress load reports back `model_status=loading` instead of
+starting a second download; an already-finished load (success or
+failure) reports back its final state instead of retrying. `model_status`
+is one of `not_loaded` (never requested) / `loading` / `loaded` /
+`load_failed` (attempted and failed -- see `model_status_reason`).
+
+If a Colab GPU is unavailable, shard downloads stall, or VRAM runs out,
+`/load_model` reports `model_status=load_failed` with a reason and the
+server keeps running -- this is exactly the environment-limitation
+case this spike is built to record cleanly instead of crash on, and
+`/predict` continues to fail with a structured `model_not_loaded`/
+`action_adapter_required` error so the local `RealVLAPolicyClient`
+falls back.
+
 ## Using it
 
 ### 1. Run the notebook
 
 Open `notebooks/colab_vla_server_spike_v0.ipynb` in Colab, fill in
 `REPO_URL` (cell 3), pick a `SERVER_MODE` (cell 4, start with
-`mock-action`), run all cells, and copy the printed `public_url`.
+`mock-action`), run all cells through cell 6 ("Test curl commands"),
+and copy the printed `public_url`. The server is fully up and
+`/health`-reachable at this point regardless of `SERVER_MODE`.
+
+If (and only if) you set `SERVER_MODE = "openvla-dryrun"` and actually
+want to try loading the real model, run cell 6b
+(`POST /load_model`) next -- it's the only cell that ever downloads
+anything, it's optional, and it can take a while (or fail) without
+taking the server down with it.
 
 ### 2. Update the local config
 
