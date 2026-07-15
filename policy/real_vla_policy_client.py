@@ -29,7 +29,7 @@ import requests
 from policy.base_policy import BasePolicy
 from policy.policy_types import PolicyInput, PolicyOutput
 from policy.vla_action_postprocessor import validate_and_postprocess_vla_action
-from policy.vla_image_preprocessor import encode_policy_image_for_vla
+from policy.vla_image_preprocessor import encode_policy_image_for_vla, encode_policy_images_by_role_for_vla
 
 DEFAULT_CONFIG_PATH = "configs/real_vla_backend_config.json"
 
@@ -90,7 +90,9 @@ class RealVLAPolicyClient(BasePolicy):
         except requests.exceptions.RequestException as exc:
             print(f"Warning: could not reset Real VLA server at {self.reset_url}: {exc}")
 
-    def _build_payload(self, policy_input: PolicyInput, image_payload: Optional[dict]) -> dict:
+    def _build_payload(
+        self, policy_input: PolicyInput, image_payload: Optional[dict], images_by_role_payload: Optional[dict] = None
+    ) -> dict:
         payload = {
             "instruction": policy_input.instruction,
             "step_index": policy_input.step_index,
@@ -99,6 +101,13 @@ class RealVLAPolicyClient(BasePolicy):
             "image": image_payload,
             "action_schema": self.action_schema,
         }
+        if images_by_role_payload:
+            # Multi-camera path (e.g. HuggingFaceVLA/smolvla_libero's
+            # main+wrist) -- additive, never replaces "image" above, so a
+            # server that only understands the legacy single-image field
+            # still gets one. See vla_server/generic_vla_server.py's
+            # PredictRequest.images.
+            payload["images"] = images_by_role_payload
         if self.request_schema.get("include_robot_state", True):
             payload["robot_state"] = policy_input.robot_state
         if self.request_schema.get("include_task_goal", True):
@@ -149,7 +158,10 @@ class RealVLAPolicyClient(BasePolicy):
 
     def predict_action(self, policy_input: PolicyInput) -> PolicyOutput:
         image_payload, image_debug = encode_policy_image_for_vla(policy_input.image, self.config)
-        payload = self._build_payload(policy_input, image_payload)
+        images_by_role_payload, _images_by_role_debug = encode_policy_images_by_role_for_vla(
+            policy_input.images_by_role, self.config
+        )
+        payload = self._build_payload(policy_input, image_payload, images_by_role_payload)
 
         start = time.perf_counter()
         try:
@@ -188,11 +200,21 @@ class RealVLAPolicyClient(BasePolicy):
         info["fallback_used"] = False
         info["real_vla_request_failed"] = False
         info["used_image_input"] = image_payload is not None
-        info["action_postprocess"] = {
-            "translation_clipped": postprocess_debug["translation_clipped"],
-            "rotation_clipped": postprocess_debug["rotation_clipped"],
-            "gripper_normalized": postprocess_debug["gripper_normalized"],
-        }
+        # Merge (not replace): some model_family adapters attach richer
+        # server-side debug here (e.g. SmolVLAActionAdapter's
+        # canonical_command/degraded_input for HuggingFaceVLA/smolvla_libero,
+        # see vla_adapters/smolvla_adapter.py) -- clobbering the whole
+        # sub-dict with only this client-side postprocessor's own fields
+        # would silently discard that.
+        server_action_postprocess = dict(info.get("action_postprocess") or {})
+        server_action_postprocess.update(
+            {
+                "translation_clipped": postprocess_debug["translation_clipped"],
+                "rotation_clipped": postprocess_debug["rotation_clipped"],
+                "gripper_normalized": postprocess_debug["gripper_normalized"],
+            }
+        )
+        info["action_postprocess"] = server_action_postprocess
         self.last_info = info
 
         return PolicyOutput(

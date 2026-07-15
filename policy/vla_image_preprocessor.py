@@ -63,3 +63,21 @@ def encode_policy_image_for_vla(image: Optional[np.ndarray], config: dict) -> Tu
         "encoding_latency_ms": round(encoding_latency_ms, 3),
     }
     return image_payload, debug
+
+
+def encode_policy_images_by_role_for_vla(images_by_role: Optional[dict], config: dict) -> Tuple[dict, dict]:
+    """Multi-camera counterpart of encode_policy_image_for_vla() -- same
+    per-image encoding (resize/JPEG/base64), applied independently to
+    each {role: np.ndarray} entry. Returns ({role: image_payload}, {role:
+    debug}); ({}, {}) if images_by_role is None/empty, so a caller can
+    always iterate the result without a None-check."""
+    if not images_by_role:
+        return {}, {}
+
+    payloads = {}
+    debugs = {}
+    for role, image in images_by_role.items():
+        payload, debug = encode_policy_image_for_vla(image, config)
+        payloads[role] = payload
+        debugs[role] = debug
+    return payloads, debugs

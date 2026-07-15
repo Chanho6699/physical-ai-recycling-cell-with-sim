@@ -26,6 +26,7 @@ FastAPI OpenVLA server here yet.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -159,6 +160,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--real-vla-config", type=str, default=DEFAULT_REAL_VLA_CONFIG)
     parser.add_argument(
         "--real-vla-fallback-backend", choices=["none", "local-dummy", "fastapi-dummy"], default="local-dummy"
+    )
+    parser.add_argument(
+        "--real-vla-observation-mode",
+        choices=["legacy", "pybullet"],
+        default="legacy",
+        help=(
+            "'pybullet': render PyBulletPandaBackend's real main+wrist cameras and read its "
+            "real 8D LIBERO state (ee_position/ee_orientation_axis_angle/gripper_qpos) every "
+            "step and send them to the VLA server -- HuggingFaceVLA/smolvla_libero's "
+            "production (degraded_input=false) path. 'legacy' (default): unchanged single "
+            "task_frame/--policy-observation-source image, no 8D state -- the server-side "
+            "adapter marks this degraded_input=true regardless of which model_family is "
+            "actually loaded."
+        ),
+    )
+    parser.add_argument(
+        "--strict-real-vla",
+        action="store_true",
+        help=(
+            "Abort the run immediately (raise RuntimeError) if any step's server response "
+            "doesn't have compatibility.passed, semantic_action_valid, and (not "
+            "degraded_input) and (not fallback_used) all true -- so a fallback or a "
+            "compatibility-gate rejection can never quietly stand in for a real production "
+            "result. Forces --real-vla-fallback-backend to 'none' regardless of what was "
+            "passed (a fallback defeats the point of this flag) -- see "
+            "create_policy_backend()."
+        ),
+    )
+    parser.add_argument(
+        "--control-loop-timeout-s",
+        type=float,
+        default=120.0,
+        help=(
+            "Wall-clock ceiling for the online policy control loop "
+            "(run_dummy_openvla_policy), independent of --max-policy-steps -- aborts with "
+            "RuntimeError if exceeded (e.g. a hung/unreachable VLA server), so a broken "
+            "connection can't spin forever."
+        ),
     )
 
     parser.add_argument("--policy", choices=["scripted", "dummy-openvla"], default="dummy-openvla")
@@ -306,7 +345,19 @@ def create_policy_backend(args) -> PolicyBackend:
     if args.policy_backend == "fastapi-dummy":
         return FastAPIVLAPolicyClient(server_url=args.policy_server_url, timeout=args.policy_request_timeout)
     if args.policy_backend == "real-vla":
-        if args.real_vla_fallback_backend == "fastapi-dummy":
+        if getattr(args, "strict_real_vla", False):
+            # --strict-real-vla exists to prove a real, non-degraded,
+            # non-fallback VLA result -- a fallback policy silently
+            # standing in for a failed/degraded server call would defeat
+            # that purpose, so this flag always wins over
+            # --real-vla-fallback-backend regardless of what was passed.
+            if args.real_vla_fallback_backend != "none":
+                print(
+                    "Warning: --strict-real-vla forces fallback_policy=None "
+                    f"(ignoring --real-vla-fallback-backend={args.real_vla_fallback_backend!r})."
+                )
+            fallback_policy = None
+        elif args.real_vla_fallback_backend == "fastapi-dummy":
             fallback_policy = FastAPIVLAPolicyClient(
                 server_url=args.policy_server_url, timeout=args.policy_request_timeout
             )
@@ -593,6 +644,18 @@ def run_dummy_openvla_policy(
     policy = create_policy_backend(args)
     policy.reset()
 
+    # Per-episode identity for structured step logging (see
+    # real_vla_observation_mode="pybullet" below) -- independent of
+    # TrajectoryRecorder's own episode_dir, so logging fields exist even
+    # when --record is off.
+    episode_id = f"episode_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    loop_start_time = time.monotonic()
+    real_vla_observation_state = {
+        "last_main_image_hash": None,
+        "last_wrist_image_hash": None,
+        "last_state_8d": None,
+    }
+
     state = backend.get_state()
     target_object_position = list(sim_position)
     wrist_refinement_state = {
@@ -656,6 +719,14 @@ def run_dummy_openvla_policy(
         }
 
     for step_index in range(args.max_policy_steps):
+        elapsed_s = time.monotonic() - loop_start_time
+        if elapsed_s > args.control_loop_timeout_s:
+            raise RuntimeError(
+                f"run_dummy_openvla_policy exceeded --control-loop-timeout-s={args.control_loop_timeout_s}s "
+                f"(elapsed={elapsed_s:.1f}s at step {step_index}) -- aborting instead of spinning forever "
+                "on a hung/unreachable VLA server."
+            )
+
         robot_state = backend.get_state()
         refinement_event = None
         wrist_observation_metadata = None
@@ -669,6 +740,37 @@ def run_dummy_openvla_policy(
         observation_source = None
         visual_observation = None
         wrist_frame = None
+
+        # Real multi-camera + 8D LIBERO state observation, built fresh
+        # every step directly from PyBulletPandaBackend -- this is the
+        # HuggingFaceVLA/smolvla_libero production (degraded_input=False)
+        # path (see benchmark/test_libero_real_observation.py, built and
+        # verified in isolation in an earlier session): main+wrist camera
+        # renders go into PolicyInput.images_by_role, and the 8D state
+        # (ee_position/ee_orientation_axis_angle/gripper_qpos) is merged
+        # into a copy of robot_state under the exact field names
+        # policy_semantics/manifest.py's smolvla_libero manifest expects.
+        # Independent of --policy-observation-source/wrist_camera above,
+        # which only feed the legacy single-image PolicyInput.image path.
+        images_by_role = None
+        observation_timestamp = None
+        main_image_hash = None
+        wrist_image_hash = None
+        state_8d = None
+        if args.real_vla_observation_mode == "pybullet":
+            observation_timestamp = time.time()
+            main_image = backend.render_main_camera()
+            real_wrist_image = backend.render_wrist_camera()
+            state_8d = backend.get_libero_observation_state()
+            images_by_role = {"main": main_image, "wrist": real_wrist_image}
+            robot_state = {
+                **robot_state,
+                "ee_position": list(state_8d[0:3]),
+                "ee_orientation_axis_angle": list(state_8d[3:6]),
+                "gripper_qpos": list(state_8d[6:8]),
+            }
+            main_image_hash = hashlib.sha1(main_image.tobytes()).hexdigest()[:12]
+            wrist_image_hash = hashlib.sha1(real_wrist_image.tobytes()).hexdigest()[:12]
 
         if wrist_camera is not None and args.policy_observation_source == "wrist":
             wrist_frame, wrist_render_debug = wrist_camera.render()
@@ -824,6 +926,7 @@ def run_dummy_openvla_policy(
             phase=policy.phase,
             observation_source=observation_source,
             visual_observation=visual_observation,
+            images_by_role=images_by_role,
         )
         policy_output = policy.predict_action(policy_input)
         robot_command = action_adapter.convert(policy_output.action)
@@ -837,6 +940,76 @@ def run_dummy_openvla_policy(
             image_encoding_latencies_ms.append(image_encoding_latency_ms)
         if policy_output_info.get("model") is not None:
             policy_backend_state["model"] = policy_output_info["model"]
+
+        real_vla_step_log = None
+        if args.real_vla_observation_mode == "pybullet":
+            compatibility_info = policy_output_info.get("compatibility") or {}
+            degraded_input = bool(policy_output_info.get("degraded_input", False))
+            semantic_action_valid = bool(policy_output_info.get("semantic_action_valid", True))
+            fallback_used = bool(policy_output_info.get("fallback_used", False))
+            real_vla_request_failed = bool(policy_output_info.get("real_vla_request_failed", False))
+            compatibility_passed = compatibility_info.get("passed")
+
+            # Freshness proof: the same main/wrist image hash or 8D state
+            # repeating step-over-step would mean this loop is silently
+            # resending a stale observation instead of a fresh render --
+            # exactly the failure mode item 3/4 (state/wrist-image must
+            # change) exists to catch.
+            observation_repeated = (
+                step_index > 0
+                and main_image_hash == real_vla_observation_state["last_main_image_hash"]
+                and wrist_image_hash == real_vla_observation_state["last_wrist_image_hash"]
+                and state_8d == real_vla_observation_state["last_state_8d"]
+            )
+            real_vla_observation_state["last_main_image_hash"] = main_image_hash
+            real_vla_observation_state["last_wrist_image_hash"] = wrist_image_hash
+            real_vla_observation_state["last_state_8d"] = state_8d
+
+            action_postprocess_info = policy_output_info.get("action_postprocess") or {}
+            real_vla_step_log = {
+                "episode_id": episode_id,
+                "step_id": step_index,
+                "observation_timestamp": observation_timestamp,
+                "main_image_hash": main_image_hash,
+                "wrist_image_hash": wrist_image_hash,
+                "state_8d": state_8d,
+                "observation_repeated": observation_repeated,
+                "server_latency_ms": inference_latency_ms,
+                "canonical_command": action_postprocess_info.get("canonical_command"),
+                "safety_clipped": action_postprocess_info.get("safety_clipped"),
+                "compatibility_passed": compatibility_passed,
+                "semantic_action_valid": semantic_action_valid,
+                "degraded_input": degraded_input,
+                "fallback_used": fallback_used,
+                "real_vla_request_failed": real_vla_request_failed,
+            }
+            print(
+                f"[step {step_index:02d}] real_vla_observation: "
+                f"main_hash={main_image_hash} wrist_hash={wrist_image_hash} "
+                f"repeated={observation_repeated} compatibility_passed={compatibility_passed} "
+                f"semantic_action_valid={semantic_action_valid} degraded_input={degraded_input} "
+                f"fallback_used={fallback_used}"
+            )
+
+            if args.strict_real_vla:
+                strict_violations = []
+                if compatibility_passed is not True:
+                    strict_violations.append(f"compatibility.passed={compatibility_passed!r} (expected True)")
+                if not semantic_action_valid:
+                    strict_violations.append("semantic_action_valid=False")
+                if degraded_input:
+                    strict_violations.append("degraded_input=True")
+                if fallback_used:
+                    strict_violations.append("fallback_used=True")
+                if real_vla_request_failed:
+                    strict_violations.append("real_vla_request_failed=True")
+                if observation_repeated:
+                    strict_violations.append("observation_repeated=True (stale observation resent)")
+                if strict_violations:
+                    raise RuntimeError(
+                        f"--strict-real-vla violated at step {step_index}: {'; '.join(strict_violations)}. "
+                        f"info={policy_output_info}"
+                    )
 
         policy_observation_event = None
         if args.record_policy_observations:
@@ -878,8 +1051,12 @@ def run_dummy_openvla_policy(
             policy_observation_state["recorded_wrist_observation_steps"] += 1
 
         step_extra = None
-        if refinement_event is not None or policy_observation_event is not None:
-            step_extra = {**(refinement_event or {}), **(policy_observation_event or {})}
+        if refinement_event is not None or policy_observation_event is not None or real_vla_step_log is not None:
+            step_extra = {
+                **(refinement_event or {}),
+                **(policy_observation_event or {}),
+                **({"real_vla_step_log": real_vla_step_log} if real_vla_step_log is not None else {}),
+            }
 
         safety_record = None
         if safety_gate is not None:
@@ -903,6 +1080,14 @@ def run_dummy_openvla_policy(
                 return with_wrist_refinement_info(final_state), step_index + 1
 
         state = backend.apply_command(robot_command, steps=args.steps_per_action, step_delay=simulation_step_delay)
+
+        if real_vla_step_log is not None:
+            # Post-apply pose, logged from the same backend state used for
+            # the print below -- proves the command returned by /predict
+            # was actually applied to the sim (item: "post-apply EE
+            # pose/gripper state" in the required logging fields).
+            real_vla_step_log["post_apply_ee_position"] = list(state["end_effector_position"])
+            real_vla_step_log["post_apply_gripper_state"] = state.get("gripper_state")
 
         distance_to_target = (policy_output.info or {}).get("distance_to_target")
         dist_str = f"{distance_to_target:.3f}" if distance_to_target is not None else "n/a"

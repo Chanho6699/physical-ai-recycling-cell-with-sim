@@ -895,60 +895,129 @@ def _tokenize_language(tokenizer, model_config, instructions: list, device: str)
 
 # HuggingFaceVLA/smolvla_libero's real input_features (confirmed via its
 # config.json, see policy_semantics/manifest.py's _SMOLVLA_LIBERO_MANIFEST):
-# two camera keys, 8-dim state. This project has one camera today, so
-# that single image is replicated across both keys (same "one camera
-# satisfies N expected image inputs" approach _build_visual_batch() uses
-# for smolvla_base) -- and there is no real 8-dim EE-pose+gripper-qpos
-# state plumbed from this project's robot_state dict yet, so
-# observation.state is a zero vector, explicitly marked degraded_input
-# in the resulting CanonicalRobotCommand rather than silently pretended
-# to be a real reading.
+# two camera keys, 8-dim state.
 _SMOLVLA_LIBERO_IMAGE_KEYS = ("observation.images.image", "observation.images.image2")
+# Positional pairing with _SMOLVLA_LIBERO_IMAGE_KEYS above: "image" <- "main",
+# "image2" <- "wrist" -- matches _SMOLVLA_LIBERO_MANIFEST.required_camera_roles
+# and CAMERA_ROLE_TO_KEY in policy_semantics/adapters/smolvla_libero_adapter.py.
+_SMOLVLA_LIBERO_CAMERA_ROLE_ORDER = ("main", "wrist")
 _SMOLVLA_LIBERO_STATE_DIM = 8
+# Order matches policy_semantics/manifest.py's _SMOLVLA_LIBERO_MANIFEST.state_fields
+# exactly: ee_position(3) + ee_orientation_axis_angle(3) + gripper_qpos(2) = 8.
+_SMOLVLA_LIBERO_STATE_FIELD_DIMS = (("ee_position", 3), ("ee_orientation_axis_angle", 3), ("gripper_qpos", 2))
+
+
+def _image_array_to_chw_float(image_array):
+    """HWC uint8 (or already-float) numpy array -> CHW float32 in [0, 1].
+    Factored out so both the real-multi-camera and legacy-duplicated-image
+    paths below apply identical preprocessing -- this checkpoint's saved
+    preprocessor pipeline expects exactly this layout/dtype as input
+    (confirmed empirically: an HWC uint8 array reaches its internal
+    resize_with_pad() bilinear interpolation and fails with
+    "upsample_bilinear2d_out_frame not implemented for 'Byte'" -- this
+    saved config apparently has no dtype/layout-conversion step of its
+    own, unlike a raw LeRobot dataset's camera frame)."""
+    import numpy as np
+
+    array = np.asarray(image_array)
+    if array.ndim == 3 and array.shape[-1] == 3:
+        array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
+    chw_float = array.astype(np.float32)
+    if chw_float.max() > 1.0:
+        chw_float = chw_float / 255.0
+    return chw_float
+
+
+def _build_smolvla_libero_images(model_input: dict):
+    """Returns ({observation.images.image/-2: CHW float32 array},
+    degraded: bool, source: str). Real path: model_input["images_by_role"]
+    (see vla_adapters/smolvla_adapter.py's build_model_input(), ultimately
+    from PyBulletPandaBackend.render_main_camera()/render_wrist_camera())
+    has both "main" and "wrist" -> each camera's own independent frame is
+    used, never duplicated. Falls back to model_input["image"] (this
+    project's older single-image path) duplicated across both keys, or an
+    all-zero placeholder if even that's missing -- both fallbacks are
+    legacy/degraded, and this always says so via `degraded`/`source`
+    rather than silently proceeding as if it were real."""
+    import numpy as np
+
+    images_by_role = model_input.get("images_by_role") or {}
+    if all(
+        images_by_role.get(role) is not None for role in _SMOLVLA_LIBERO_CAMERA_ROLE_ORDER
+    ):
+        observation_images = {
+            key: _image_array_to_chw_float(images_by_role[role])
+            for key, role in zip(_SMOLVLA_LIBERO_IMAGE_KEYS, _SMOLVLA_LIBERO_CAMERA_ROLE_ORDER)
+        }
+        return observation_images, False, "real_multi_camera"
+
+    image_array = model_input.get("image")
+    if image_array is not None:
+        image_chw_float = _image_array_to_chw_float(image_array)
+        return (
+            {key: image_chw_float for key in _SMOLVLA_LIBERO_IMAGE_KEYS},
+            True,
+            "legacy_single_image_duplicated",
+        )
+
+    zero_image = np.zeros((3, 256, 256), dtype=np.float32)
+    return {key: zero_image for key in _SMOLVLA_LIBERO_IMAGE_KEYS}, True, "none_zero_placeholder"
+
+
+def _build_smolvla_libero_state(model_input: dict):
+    """Returns (8-dim np.float32 array, degraded: bool, source: str).
+    Real path: model_input["robot_state"] is a dict with
+    ee_position(3)/ee_orientation_axis_angle(3)/gripper_qpos(2) --
+    exactly what PyBulletPandaBackend.get_libero_observation_state()
+    produces (as a flat list; the caller building robot_state is
+    expected to split it into these 3 named keys, matching
+    policy_semantics/manifest.py's declared state_fields order/names).
+    Falls back to an all-zero 8-vector (degraded=True, source=
+    "zero_placeholder") if robot_state is missing any of the 3 fields or
+    any field has the wrong length -- never guesses partial data."""
+    import numpy as np
+
+    robot_state = model_input.get("robot_state") or {}
+    values = []
+    for field_name, expected_dim in _SMOLVLA_LIBERO_STATE_FIELD_DIMS:
+        field_value = robot_state.get(field_name)
+        if field_value is None or len(field_value) != expected_dim:
+            return np.zeros((_SMOLVLA_LIBERO_STATE_DIM,), dtype=np.float32), True, "zero_placeholder"
+        values.extend(float(component) for component in field_value)
+
+    return np.array(values, dtype=np.float32), False, "real_robot_state"
 
 
 def _run_smolvla_libero_inference(model, preprocessor_pipeline, postprocessor_pipeline, model_input: dict):
     """Real official-processor path for HuggingFaceVLA/smolvla_libero (or
     any future model_id added to _MODELS_WITH_OFFICIAL_PROCESSOR_FILES):
     builds the plain-dict observation LeRobot's own preprocessor pipeline
-    expects, runs it, adds the batch dimension the loaded saved-config
-    pipeline does not add on its own for image/state tensors (confirmed
-    empirically this session -- observation.language.tokens/
-    attention_mask already come back batched from the tokenizer step,
-    but observation.images.*/observation.state do not), calls
+    expects (using real per-camera images/state when the caller provided
+    them -- see _build_smolvla_libero_images()/_build_smolvla_libero_state()
+    -- degraded placeholders otherwise, always disclosed via
+    NativePolicyAction.metadata), runs it, adds the batch dimension the
+    loaded saved-config pipeline does not add on its own for image/state
+    tensors (confirmed empirically this session -- observation.language.
+    tokens/attention_mask already come back batched from the tokenizer
+    step, but observation.images.*/observation.state do not), calls
     policy.select_action(), then runs the real official postprocessor
     (unnormalizes using this checkpoint's own baked-in dataset stats) --
     never this module's own guessed normalization. Returns a
     NativePolicyAction with postprocessor_used=True."""
-    import numpy as np
     import torch
 
     from policy_semantics.native_policy_action import NativePolicyAction
 
     device = resolve_device()
 
-    image_array = model_input.get("image")
-    if image_array is None:
-        image_chw_float = np.zeros((3, 256, 256), dtype=np.float32)
-    else:
-        # This checkpoint's saved preprocessor pipeline expects CHW
-        # float32 in [0, 1] as input (confirmed empirically: an HWC
-        # uint8 array reaches its internal resize_with_pad() bilinear
-        # interpolation and fails with "upsample_bilinear2d_out_frame
-        # not implemented for 'Byte'" -- this saved config apparently
-        # has no dtype/layout-conversion step of its own, unlike a raw
-        # LeRobot dataset's camera frame).
-        array = np.asarray(image_array)
-        if array.ndim == 3 and array.shape[-1] == 3:
-            array = np.transpose(array, (2, 0, 1))  # HWC -> CHW
-        image_chw_float = array.astype(np.float32)
-        if image_chw_float.max() > 1.0:
-            image_chw_float = image_chw_float / 255.0
+    observation_images, images_degraded, images_source = _build_smolvla_libero_images(model_input)
+    observation_state, state_degraded, state_source = _build_smolvla_libero_state(model_input)
+    degraded_input = images_degraded or state_degraded
 
     instruction = model_input.get("instruction", "")
 
-    observation = {key: image_chw_float for key in _SMOLVLA_LIBERO_IMAGE_KEYS}
-    observation["observation.state"] = np.zeros((_SMOLVLA_LIBERO_STATE_DIM,), dtype=np.float32)
+    observation = dict(observation_images)
+    observation["observation.state"] = observation_state
     observation["task"] = instruction
 
     processed = preprocessor_pipeline(observation)
@@ -963,6 +1032,17 @@ def _run_smolvla_libero_inference(model, preprocessor_pipeline, postprocessor_pi
         value = processed[key]
         batch[key] = value.to(device) if isinstance(value, torch.Tensor) else value
 
+    # Same final dtype/device alignment pass as _run_smolvla_inference()
+    # (see _align_batch_dtype_device's docstring): the preprocessor
+    # pipeline builds image/state tensors in whatever dtype it defaults to
+    # (observed live: float32), which does not necessarily match the
+    # loaded model's actual compute dtype (observed live: bfloat16 from
+    # VLA_DTYPE) -- without this, model.select_action() below fails with
+    # "mat1 and mat2 must have the same dtype, but got Float and BFloat16".
+    configured_dtype = getattr(torch, resolve_dtype_name(), torch.float32)
+    model_dtype, model_device = _resolve_model_dtype_device(model, configured_dtype, device)
+    batch = _align_batch_dtype_device(batch, model_dtype, model_device)
+
     with torch.inference_mode():
         raw_action = model.select_action(batch)
 
@@ -975,7 +1055,9 @@ def _run_smolvla_libero_inference(model, preprocessor_pipeline, postprocessor_pi
         source_policy=model_input.get("model_id_or_path", "HuggingFaceVLA/smolvla_libero"),
         postprocessor_used=True,
         metadata={
-            "degraded_input": True,  # observation.state is a zero placeholder, see function docstring
+            "degraded_input": degraded_input,
+            "images_source": images_source,
+            "state_source": state_source,
             "raw_model_action": raw_action.detach().cpu().flatten().tolist(),
         },
     )

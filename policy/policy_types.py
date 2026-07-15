@@ -21,6 +21,16 @@ class PolicyInput:
     # later without changing PolicyInput's shape again.
     observation_source: Optional[str] = None
     visual_observation: Optional[dict] = None
+    # Multi-camera observation, keyed by role (e.g. "main", "wrist") --
+    # np.ndarray HWC uint8 per role, e.g. from
+    # PyBulletPandaBackend.render_main_camera()/render_wrist_camera().
+    # None (the default) means "legacy single-image path" -- `image`
+    # above is still what gets sent in that case. Added for
+    # HuggingFaceVLA/smolvla_libero's two-camera requirement (see
+    # policy_semantics/manifest.py's _SMOLVLA_LIBERO_MANIFEST) without
+    # changing what single-camera callers (mock-action, smolvla_base)
+    # already do.
+    images_by_role: Optional[dict] = None
 
 
 @dataclass

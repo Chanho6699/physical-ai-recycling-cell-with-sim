@@ -42,6 +42,8 @@ import pybullet_data
 from action_adapter.adapter_v0 import RobotCommand
 from robot_core.robot_backend import RobotBackend
 from robot_sim.backend_interface import SimulatorBackend
+from robot_sim.camera_utils import capture_pybullet_camera
+from robot_sim.pybullet_wrist_camera import PyBulletWristCamera
 
 GRASP_THRESHOLD = 0.05
 PLACE_THRESHOLD = 0.08
@@ -75,6 +77,22 @@ READY_JOINT_POSITIONS = [0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi 
 
 DEFAULT_MOVE_STEPS = 120
 DEFAULT_GRIPPER_STEPS = 60
+
+# main camera: fixed, world-space, framing the whole workspace (table +
+# _object_position + _bin_position, see __init__) -- unlike the wrist
+# camera, its pose never depends on the robot's current configuration.
+MAIN_CAMERA_EYE = [0.9, -0.6, 0.85]
+MAIN_CAMERA_TARGET = [0.35, 0.15, 0.05]
+MAIN_CAMERA_UP = [0.0, 0.0, 1.0]
+MAIN_CAMERA_FOV = 60.0
+MAIN_CAMERA_NEAR = 0.1
+MAIN_CAMERA_FAR = 3.0
+
+# HuggingFaceVLA/smolvla_libero's real input_features (confirmed via its
+# config.json -- see policy_semantics/manifest.py's
+# _SMOLVLA_LIBERO_MANIFEST): both cameras are (3, 256, 256).
+LIBERO_CAMERA_WIDTH = 256
+LIBERO_CAMERA_HEIGHT = 256
 
 
 def _evaluate_safety_result(result):
@@ -119,6 +137,9 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
         # composing against a re-read achieved value would let per-call
         # IK convergence error accumulate across many calls.
         self._goal_orientation = None
+        # Lazily constructed in reset() (needs client_id/robot_id) --
+        # see render_wrist_camera().
+        self._wrist_camera = None
 
         self._table_id = None
         self._object_id = None
@@ -177,6 +198,17 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
 
         _, self.default_orientation = self._get_ee_pose()
         self._goal_orientation = self.default_orientation
+
+        # Rebuilt every reset() (a stale client_id/robot_id from a
+        # previous connection would otherwise dangle) -- see
+        # render_wrist_camera(). Resolution overridden to
+        # LIBERO_CAMERA_WIDTH/HEIGHT to match HuggingFaceVLA/smolvla_libero's
+        # declared input_features, not PyBulletWristCamera's own default
+        # (320x240, tuned for the earlier ArUco/segmentation-based
+        # grasp-refinement use case, not for feeding a VLA policy).
+        self._wrist_camera = PyBulletWristCamera(client_id=self.client_id, robot_id=self.robot_id)
+        self._wrist_camera.width = LIBERO_CAMERA_WIDTH
+        self._wrist_camera.height = LIBERO_CAMERA_HEIGHT
 
         self._object_id = self._create_box(
             half_extents=[0.02, 0.02, 0.02],
@@ -275,6 +307,76 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
         Not state (doesn't touch the sim), just a fixed declaration of
         what this backend implementation supports."""
         return dict(BACKEND_CAPABILITIES)
+
+    def get_libero_observation_state(self) -> list:
+        """The 8-dim state vector policy_semantics/manifest.py's
+        _SMOLVLA_LIBERO_MANIFEST declares (state_fields, in this exact
+        order): EE position [x, y, z] (robot_base frame, meters), EE
+        orientation as an axis-angle rotation vector [rx, ry, rz]
+        (robot_base frame, radians -- NOT a quaternion; converted via
+        p.getAxisAngleFromQuaternion() and scaled by angle, the same
+        [axis * angle] convention CanonicalRobotCommand.rotation_axis_angle_rad
+        already uses, so this state and that command share one
+        representation), left finger joint position, right finger joint
+        position (both meters, panda_finger_joint1/2 -- see
+        finger_joint_indices). This project's PyBullet base has identity
+        orientation relative to world (see class docstring), so
+        world-frame == robot_base-frame here, same as apply_command()'s
+        translation/rotation deltas."""
+        ee_position, ee_orientation_quat = self._get_ee_pose()
+
+        axis, angle = p.getAxisAngleFromQuaternion(ee_orientation_quat)
+        ee_orientation_axis_angle = [axis[0] * angle, axis[1] * angle, axis[2] * angle]
+
+        finger_states = p.getJointStates(self.robot_id, self.finger_joint_indices, physicsClientId=self.client_id)
+        left_finger_qpos = finger_states[0][0]
+        right_finger_qpos = finger_states[1][0]
+
+        return [
+            ee_position[0],
+            ee_position[1],
+            ee_position[2],
+            ee_orientation_axis_angle[0],
+            ee_orientation_axis_angle[1],
+            ee_orientation_axis_angle[2],
+            left_finger_qpos,
+            right_finger_qpos,
+        ]
+
+    def render_main_camera(self, width: int = LIBERO_CAMERA_WIDTH, height: int = LIBERO_CAMERA_HEIGHT):
+        """Fixed, world-space camera framing the whole workspace (table +
+        object + bin) -- reuses robot_sim/camera_utils.py's plain
+        capture_pybullet_camera() unchanged, just with this backend's own
+        MAIN_CAMERA_* pose and this checkpoint's expected resolution.
+        Returns an (H, W, 3) uint8 RGB array. Never depends on the
+        robot's current configuration, unlike render_wrist_camera()."""
+        return capture_pybullet_camera(
+            width=width,
+            height=height,
+            camera_eye=MAIN_CAMERA_EYE,
+            camera_target=MAIN_CAMERA_TARGET,
+            camera_up=MAIN_CAMERA_UP,
+            fov=MAIN_CAMERA_FOV,
+            near_val=MAIN_CAMERA_NEAR,
+            far_val=MAIN_CAMERA_FAR,
+            physics_client_id=self.client_id,
+        )
+
+    def render_wrist_camera(self):
+        """Eye-in-hand camera rigidly attached to end_effector_link_index
+        -- delegates entirely to robot_sim/pybullet_wrist_camera.py's
+        PyBulletWristCamera (already used by the ArUco/segmentation
+        grasp-refinement path; reused here rather than reimplementing
+        EE-relative view-matrix math a second time), recomputed from the
+        robot's *current* pose every call, so it genuinely tracks robot
+        movement. Returns an (H, W, 3) uint8 RGB array at
+        LIBERO_CAMERA_WIDTH/HEIGHT (set on self._wrist_camera in
+        reset()), not PyBulletWristCamera's own 320x240 default. Raises
+        RuntimeError if called before reset()."""
+        if self._wrist_camera is None:
+            raise RuntimeError("render_wrist_camera() called before reset() -- no wrist camera constructed yet.")
+        frame, _debug = self._wrist_camera.render()
+        return frame["rgb"]
 
     def move_end_effector_to(
         self,

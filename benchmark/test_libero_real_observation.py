@@ -1,0 +1,185 @@
+"""Real PyBullet observation tests for HuggingFaceVLA/smolvla_libero (v0).
+
+Covers this task's 9 required scenarios. Items 1-6 exercise
+PyBulletPandaBackend directly (no GPU/model needed); items 7-8 exercise
+vla_server/model_loader.py's _build_smolvla_libero_images()/
+_build_smolvla_libero_state() directly (pure functions, no model
+either); item 9 re-runs the three prior policy_semantics/rotation/
+mock-action suites to confirm no regression.
+
+Run: python -m benchmark.test_libero_real_observation
+"""
+
+import numpy as np
+
+from robot_sim.pybullet_panda_backend import (
+    LIBERO_CAMERA_HEIGHT,
+    LIBERO_CAMERA_WIDTH,
+    PyBulletPandaBackend,
+)
+from action_adapter.adapter_v0 import RobotCommand
+from vla_server.model_loader import _build_smolvla_libero_images, _build_smolvla_libero_state
+
+_FAILURES = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    status = "PASS" if condition else "FAIL"
+    print(f"[{status}] {name}" + (f" -- {detail}" if detail and not condition else ""))
+    if not condition:
+        _FAILURES.append(name)
+
+
+def fresh_backend() -> PyBulletPandaBackend:
+    backend = PyBulletPandaBackend(gui=False)
+    backend.reset()
+    return backend
+
+
+def main() -> None:
+    print("=== 1. Panda move -> 8D state EE position actually changes ===")
+    backend = fresh_backend()
+    state_before = backend.get_libero_observation_state()
+    command = RobotCommand(
+        target_dx=0.05, target_dy=0.0, target_dz=0.0, target_droll=0.0, target_dpitch=0.0, target_dyaw=0.0,
+        gripper_command="open",
+    )
+    backend.apply_command(command, steps=60)
+    state_after = backend.get_libero_observation_state()
+    pos_delta = [state_after[i] - state_before[i] for i in range(3)]
+    check("EE position[0] (+X) actually changed by ~0.05m", pos_delta[0] > 0.01, f"pos_delta={pos_delta}")
+    check("EE position[1]/[2] stayed roughly still", abs(pos_delta[1]) < 0.01 and abs(pos_delta[2]) < 0.01, f"pos_delta={pos_delta}")
+    backend.shutdown()
+    print()
+
+    print("=== 2. Panda rotation -> 8D state axis-angle actually changes ===")
+    backend = fresh_backend()
+    state_before = backend.get_libero_observation_state()
+    command = RobotCommand(
+        target_dx=0.0, target_dy=0.0, target_dz=0.0, target_droll=0.3, target_dpitch=0.0, target_dyaw=0.0,
+        gripper_command="open",
+    )
+    backend.apply_command(command, steps=60)
+    state_after = backend.get_libero_observation_state()
+    orn_delta = [state_after[3 + i] - state_before[3 + i] for i in range(3)]
+    orn_delta_mag = sum(d * d for d in orn_delta) ** 0.5
+    check("axis-angle state component actually changed", orn_delta_mag > 0.05, f"orn_delta={orn_delta}")
+    backend.shutdown()
+    print()
+
+    print("=== 3. gripper open/close -> both finger qpos change ===")
+    backend = fresh_backend()
+    state_open = backend.get_libero_observation_state()
+    close_command = RobotCommand(
+        target_dx=0.0, target_dy=0.0, target_dz=0.0, target_droll=0.0, target_dpitch=0.0, target_dyaw=0.0,
+        gripper_command="close",
+    )
+    backend.apply_command(close_command, steps=30)
+    state_closed = backend.get_libero_observation_state()
+    left_delta = state_open[6] - state_closed[6]
+    right_delta = state_open[7] - state_closed[7]
+    check("left finger qpos decreased on close", left_delta > 0.01, f"open={state_open[6]}, closed={state_closed[6]}")
+    check("right finger qpos decreased on close", right_delta > 0.01, f"open={state_open[7]}, closed={state_closed[7]}")
+    backend.shutdown()
+    print()
+
+    print("=== 4. main and wrist images are not identical ===")
+    backend = fresh_backend()
+    main_img = backend.render_main_camera()
+    wrist_img = backend.render_wrist_camera()
+    check("main image != wrist image", not np.array_equal(main_img, wrist_img))
+    backend.shutdown()
+    print()
+
+    print("=== 5. wrist camera view changes as the robot moves ===")
+    backend = fresh_backend()
+    wrist_before = backend.render_wrist_camera()
+    command = RobotCommand(
+        target_dx=0.05, target_dy=0.05, target_dz=0.0, target_droll=0.0, target_dpitch=0.0, target_dyaw=0.0,
+        gripper_command="open",
+    )
+    backend.apply_command(command, steps=60)
+    wrist_after = backend.render_wrist_camera()
+    wrist_diff = np.abs(wrist_after.astype(int) - wrist_before.astype(int)).mean()
+    check("wrist image changed after robot movement", not np.array_equal(wrist_before, wrist_after))
+    check("wrist image change is non-trivial (not a 1-pixel fluke)", wrist_diff > 0.5, f"wrist_diff={wrist_diff}")
+    backend.shutdown()
+    print()
+
+    print("=== 6. observation shape/dtype matches SmolVLA processor requirements ===")
+    backend = fresh_backend()
+    main_img = backend.render_main_camera()
+    wrist_img = backend.render_wrist_camera()
+    state8d = backend.get_libero_observation_state()
+    check("main image is (256, 256, 3) uint8", main_img.shape == (LIBERO_CAMERA_HEIGHT, LIBERO_CAMERA_WIDTH, 3) and main_img.dtype == np.uint8, f"shape={main_img.shape}, dtype={main_img.dtype}")
+    check("wrist image is (256, 256, 3) uint8", wrist_img.shape == (LIBERO_CAMERA_HEIGHT, LIBERO_CAMERA_WIDTH, 3) and wrist_img.dtype == np.uint8, f"shape={wrist_img.shape}, dtype={wrist_img.dtype}")
+    check("8D state has exactly 8 float components", len(state8d) == 8 and all(isinstance(v, float) for v in state8d))
+    backend.shutdown()
+    print()
+
+    print("=== 7. real 2-camera + 8D state -> degraded_input=False ===")
+    backend = fresh_backend()
+    main_img = backend.render_main_camera()
+    wrist_img = backend.render_wrist_camera()
+    state8d = backend.get_libero_observation_state()
+    robot_state = {
+        "ee_position": state8d[0:3],
+        "ee_orientation_axis_angle": state8d[3:6],
+        "gripper_qpos": state8d[6:8],
+    }
+    model_input = {
+        "images_by_role": {"main": main_img, "wrist": wrist_img},
+        "robot_state": robot_state,
+        "instruction": "pick up the bottle",
+    }
+    images, images_degraded, images_source = _build_smolvla_libero_images(model_input)
+    state, state_degraded, state_source = _build_smolvla_libero_state(model_input)
+    check("images not degraded with real main+wrist frames", images_degraded is False, f"source={images_source}")
+    check("state not degraded with real 8D robot_state", state_degraded is False, f"source={state_source}")
+    check(
+        "the two observation.images.* arrays are genuinely different (not duplicated)",
+        not np.array_equal(images["observation.images.image"], images["observation.images.image2"]),
+    )
+    backend.shutdown()
+    print()
+
+    print("=== 8. legacy single-image / missing-state path -> degraded_input=True ===")
+    legacy_model_input = {"image": main_img, "robot_state": {}, "instruction": "pick up the bottle"}
+    legacy_images, legacy_images_degraded, legacy_images_source = _build_smolvla_libero_images(legacy_model_input)
+    legacy_state, legacy_state_degraded, legacy_state_source = _build_smolvla_libero_state(legacy_model_input)
+    check("legacy single-image path is marked degraded", legacy_images_degraded is True, f"source={legacy_images_source}")
+    check(
+        "legacy path duplicates the single image across both keys (documented degraded behavior)",
+        np.array_equal(legacy_images["observation.images.image"], legacy_images["observation.images.image2"]),
+    )
+    check("missing robot_state fields -> state marked degraded (zero-filled)", legacy_state_degraded is True, f"source={legacy_state_source}")
+    check("degraded state is all zero", all(v == 0.0 for v in legacy_state))
+
+    no_image_input = {"robot_state": {}, "instruction": "pick up the bottle"}
+    none_images, none_degraded, none_source = _build_smolvla_libero_images(no_image_input)
+    check("no image at all -> zero placeholder, still marked degraded", none_degraded is True, f"source={none_source}")
+    print()
+
+    print("=== 9. regression: policy_semantics / rotation / mock-action suites ===")
+    import subprocess
+    import sys as _sys
+
+    for module in (
+        "benchmark.test_policy_semantics",
+        "benchmark.test_smolvla_libero_action_adapter",
+        "benchmark.test_panda_rotation_and_capability",
+    ):
+        result = subprocess.run([_sys.executable, "-m", module], capture_output=True, text=True)
+        passed = "ALL CHECKS PASSED" in result.stdout
+        check(f"{module} -- ALL CHECKS PASSED", passed, result.stdout[-800:] if not passed else "")
+    print()
+
+    print("=" * 60)
+    if _FAILURES:
+        print(f"FAIL -- {len(_FAILURES)} check(s) failed: {_FAILURES}")
+    else:
+        print("ALL CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()

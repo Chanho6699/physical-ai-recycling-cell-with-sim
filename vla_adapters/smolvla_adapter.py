@@ -103,6 +103,12 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
         return {
             "instruction": policy_input_dict.get("instruction", ""),
             "image": policy_input_dict.get("image"),
+            # Multi-camera observation (e.g. {"main": ..., "wrist": ...}),
+            # passed through unchanged -- see
+            # vla_server/model_loader.py's _run_smolvla_libero_inference()
+            # for where this actually gets used instead of the legacy
+            # single-image duplication.
+            "images_by_role": policy_input_dict.get("images_by_role"),
             "robot_state": policy_input_dict.get("robot_state") or {},
             "step_index": policy_input_dict.get("step_index", 0),
             "phase": policy_input_dict.get("phase"),
@@ -229,6 +235,16 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
             "compatibility": compatibility,
             "semantic_action_valid": semantic_action_valid,
         }
+        if "degraded_input" in debug:
+            # Also surfaced at the top level (not just nested in
+            # action_postprocess) so it's as easy to check as
+            # semantic_action_valid -- and so it survives
+            # RealVLAPolicyClient.predict_action() overwriting
+            # info["action_postprocess"] with its own client-side
+            # postprocess debug (see that method's merge, which now
+            # preserves this dict's other keys but replaces this exact
+            # sub-dict wholesale).
+            info["degraded_input"] = debug["degraded_input"]
         if smoke_test_mode:
             info["smoke_test_mode"] = True
         return {"action": action, "phase": phase, "done": False, "info": info}

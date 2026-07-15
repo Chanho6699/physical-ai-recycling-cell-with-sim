@@ -52,7 +52,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -109,6 +109,13 @@ class PredictRequest(BaseModel):
     observation_source: Optional[str] = None
     visual_observation: Optional[dict] = None
     image: Optional[ImagePayload] = None
+    # Multi-camera observation, keyed by role (e.g. "main", "wrist") --
+    # see policy/policy_types.py's PolicyInput.images_by_role. Additive:
+    # a client that only sends `image` still works unchanged (legacy/
+    # degraded single-camera path); this is only present when the client
+    # actually has independent camera renders to send (e.g.
+    # PyBulletPandaBackend.render_main_camera()/render_wrist_camera()).
+    images: Optional[Dict[str, ImagePayload]] = None
     action_schema: Optional[dict] = None
 
 
@@ -173,9 +180,13 @@ def predict(req: PredictRequest):
     start = time.perf_counter()
 
     image_array = decode_request_image(req.image)
+    images_by_role = (
+        {role: decode_request_image(payload) for role, payload in req.images.items()} if req.images else None
+    )
     policy_input_dict = {
         "instruction": req.instruction,
         "image": image_array,
+        "images_by_role": images_by_role,
         "robot_state": req.robot_state or {},
         "task_goal": req.task_goal or {},
         "target_object_position": req.target_object_position,
