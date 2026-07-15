@@ -1,0 +1,7 @@
+{
+    "server_url": "http://100.75.147.72:9200/predict",
+    "health_url": "http://100.75.147.72:9200/health",
+    "reset_url": "http://100.75.147.72:9200/reset",
+    "timeout_sec": 10,
+    "fallback_backend": "local-dummy"
+}

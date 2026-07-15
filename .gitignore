@@ -81,3 +81,8 @@ results/aruco_markers/*.png
 results/wrist_camera/*.png
 results/wrist_camera/*.json
 results/safety_hand_debug/
+.venv-vla/
+
+# Device/session-specific VLA backend configs (e.g. Tailscale IP) --
+# never committed, see docs/split_deployment_tailscale_success.md
+configs/*local*.json
