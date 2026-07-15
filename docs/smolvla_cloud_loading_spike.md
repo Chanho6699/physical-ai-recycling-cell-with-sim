@@ -128,15 +128,18 @@ recommended default.
 ## SmolVLA raw output -> normalized action
 
 `vla_adapters/smolvla_adapter.py`'s `SmolVLAActionAdapter` handles, in
-order: a plain 7-number vector; a `{"action": ...}` dict; a chunked
-`{"actions": [...]}` dict (action-horizon policies, selected by
-`step_index`); a bare chunked `[T, 7]` list; a batched `[B, T, 7]` (or
-`[B, 7]`) list; any of the above as a numpy array or torch tensor
+order: a plain 6- or 7-number vector; a `{"action": ...}` dict; a
+chunked `{"actions": [...]}` dict (action-horizon policies, selected by
+`step_index`); a bare chunked `[T, 6/7]` list; a batched `[B, T, 6/7]`
+(or `[B, 6/7]`) list; any of the above as a numpy array or torch tensor
 instead of a plain list. It does this via a small bounded recursive
 "peel one dimension, select by `step_index`" pass
-(`_peel_to_vector()`) rather than assuming one fixed shape.
+(`_peel_to_vector()`) rather than assuming one fixed shape. A 6-number
+vector isn't a different shape to reject -- see the section below --
+it's this project's fixed 7D schema with the gripper channel filled
+in.
 
-If none of that resolves to a flat 7-number vector, the adapter
+If none of that resolves to a flat 6- or 7-number vector, the adapter
 returns a structured, fallback-triggering rejection instead of
 guessing:
 
@@ -155,6 +158,34 @@ guessing:
 contents) is exactly what tells you what to add to `_peel_to_vector()`
 for a model whose output doesn't match any of the shapes already
 handled -- extend that method, not the server or client.
+
+## `lerobot/smolvla_base` outputs 6D, not 7D -- and why filling a gripper slot was never the fix
+
+**Superseded section, kept for history.** An earlier version of this
+spike treated `lerobot/smolvla_base`'s 6-number raw output as "7D
+Cartesian delta minus a gripper channel" and padded it with a neutral
+gripper value (`_normalize_action_length()`, `GRIPPER_NEUTRAL_VALUE`) so
+the pipeline always got 7 numbers. That was only ever a *shape* fix:
+deeper investigation (see `policy_semantics/manifest.py`'s
+`_SMOLVLA_BASE_MANIFEST`) found those 6 numbers are actually
+**SO-100/SO-101 joint-space values** (a different robot's joint
+positions -- shoulder_pan/shoulder_lift/elbow_flex/wrist_flex/
+wrist_roll/gripper), not `[dx, dy, dz, droll, dpitch, dyaw]` at all. No
+amount of padding fixes that; it needs real forward/inverse kinematics
+for a different arm, which is out of scope.
+
+That filler now lives in
+`policy_semantics/adapters/legacy_shape_only_adapter.py`, isolated
+behind `VLA_SMOKE_TEST_MODE=1`, and is **never reachable on the
+production path** regardless of raw output shape --
+`policy_semantics/compatibility_gate.py`'s `CompatibilityGate` refuses
+`lerobot/smolvla_base` outright (wrong `action_space`, wrong
+`source_embodiment`, ...). See
+[docs/vla_integration_spike_log.md](vla_integration_spike_log.md) and
+this repo's `policy_semantics/` package for the current architecture.
+`HuggingFaceVLA/smolvla_libero` is the first checkpoint whose manifest
+actually passes `CompatibilityGate` -- see
+[docs/panda_axis_cross_verification.md](panda_axis_cross_verification.md).
 
 ## Success / failure interpretation, end to end
 

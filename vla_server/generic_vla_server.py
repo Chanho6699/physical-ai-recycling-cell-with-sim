@@ -130,6 +130,7 @@ def decode_request_image(image_payload: Optional[ImagePayload]) -> Optional[np.n
 @app.get("/health")
 def health():
     state = model_loader.get_state()
+    compatibility_result = model_loader.get_compatibility_result()
     return {
         "status": "ok",
         "model_family": _MODEL_FAMILY,
@@ -138,6 +139,8 @@ def health():
         "model_id_or_path": model_loader.resolve_model_id_or_path(_MODEL_FAMILY, _BACKEND_CONFIG),
         "local_files_only": model_loader.resolve_local_files_only(),
         "allow_vlm_fallback": model_loader.resolve_allow_vlm_fallback(),
+        "smoke_test_mode": model_loader.resolve_smoke_test_mode(),
+        "compatibility": compatibility_result.to_dict() if compatibility_result is not None else None,
         "adapter": type(_ADAPTER).__name__,
         "version": "v0",
     }
@@ -204,7 +207,13 @@ def predict(req: PredictRequest):
             detail={"error": "inference_failed", "model_family": _MODEL_FAMILY, "reason": str(exc)},
         )
 
-    context = {"step_index": req.step_index, "phase": req.phase}
+    compatibility_result = model_loader.get_compatibility_result()
+    context = {
+        "step_index": req.step_index,
+        "phase": req.phase,
+        "compatibility": compatibility_result.to_dict() if compatibility_result is not None else None,
+        "smoke_test_mode": model_loader.resolve_smoke_test_mode(),
+    }
     normalized = _ADAPTER.normalize_model_output(raw_output, context)
 
     server_inference_ms = (time.perf_counter() - start) * 1000
