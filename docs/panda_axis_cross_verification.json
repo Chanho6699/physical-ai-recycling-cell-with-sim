@@ -1,0 +1,86 @@
+{
+  "generated_at": "2026-07-15T13:17:35.710842+00:00",
+  "tolerances": {
+    "delta_test_min_dominance_ratio": 5.0,
+    "fk_test_tolerance_m": 0.02
+  },
+  "ready_joint_positions": [
+    0.0,
+    -0.7853981633974483,
+    0.0,
+    -2.356194490192345,
+    0.0,
+    1.5707963267948966,
+    0.7853981633974483
+  ],
+  "delta_application_test": {
+    "x": {
+      "pybullet_delta": [
+        0.049935102462768555,
+        -1.8838745745597407e-06,
+        -6.48200511932373e-05
+      ],
+      "robosuite_delta": [
+        0.005483016342695213,
+        -4.529797232073816e-05,
+        -0.0004901650452084905
+      ],
+      "pybullet_dominant_and_positive": true,
+      "robosuite_dominant_and_positive": true,
+      "same_sign": true,
+      "passed": true
+    },
+    "y": {
+      "pybullet_delta": [
+        -6.827712059020996e-05,
+        0.049975586183791165,
+        -6.207823753356934e-05
+      ],
+      "robosuite_delta": [
+        -6.196265631340514e-05,
+        0.0051660919022339085,
+        -2.295402957508408e-05
+      ],
+      "pybullet_dominant_and_positive": true,
+      "robosuite_dominant_and_positive": true,
+      "same_sign": true,
+      "passed": true
+    },
+    "z": {
+      "pybullet_delta": [
+        -5.221366882324219e-05,
+        -1.669784978730604e-06,
+        0.049926042556762695
+      ],
+      "robosuite_delta": [
+        -0.0002971492520658786,
+        -2.4532260359533264e-05,
+        0.004706701580931227
+      ],
+      "pybullet_dominant_and_positive": true,
+      "robosuite_dominant_and_positive": true,
+      "same_sign": true,
+      "passed": true
+    }
+  },
+  "forward_kinematics_test": {
+    "pybullet_ee_relative_to_base": [
+      0.3068690001964569,
+      -9.325392966275103e-06,
+      0.48526519536972046
+    ],
+    "robosuite_ee_relative_to_base": [
+      0.3068905665929409,
+      6.5635692504717e-34,
+      0.49378205230283945
+    ],
+    "abs_diff": [
+      2.1566396483985173e-05,
+      9.325392966275103e-06,
+      0.008516856933118988
+    ],
+    "tolerance_m": 0.02,
+    "passed": true
+  },
+  "axis_convention_verified": true
+}

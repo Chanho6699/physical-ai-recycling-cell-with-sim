@@ -1,4 +1,4 @@
-"""PyBullet Franka Panda URDF backend (v1).
+"""PyBullet Franka Panda URDF backend (v2 -- rotation control added).
 
 Unlike robot_sim/pybullet_backend.py (a plain end-effector sphere with
 distance-based teleport), this backend loads PyBullet's bundled Franka
@@ -19,6 +19,18 @@ via print_joint_info()):
 end_effector_link_index = 11 (panda_grasptarget) is used for IK, since it
 sits at the actual grasp point between the fingers rather than at the
 hand's own frame (link 8).
+
+v2: rotation deltas (RobotCommand.target_droll/dpitch/dyaw) are now
+actually applied, not silently dropped -- see apply_command()'s
+docstring for the goal-orientation tracking scheme and
+policy_semantics/manifest.py's PANDA_TARGET_EMBODIMENT for the
+capability flags this backend now reports
+(supports_cartesian_rotation=True). The axis-angle delta's own
+robot_base-frame convention was cross-validated against robosuite's
+Panda model this session -- see
+docs/panda_axis_cross_verification.md/.json (both real-simulation
+displacement comparisons and a same-joint-angles forward-kinematics
+comparison, not a config-file read).
 """
 
 import math
@@ -33,6 +45,25 @@ from robot_sim.backend_interface import SimulatorBackend
 
 GRASP_THRESHOLD = 0.05
 PLACE_THRESHOLD = 0.08
+
+# Defense-in-depth only -- policy_semantics/safety_filter.py's
+# PandaCommandSafetyFilter already clips CanonicalRobotCommand's
+# rotation_axis_angle_rad before it ever becomes a RobotCommand; this is
+# a second, independent bound so apply_command() never hands
+# calculateInverseKinematics() an absurd single-step orientation delta
+# regardless of caller.
+MAX_ROTATION_DELTA_RAD = 0.5
+
+# Reported via get_capabilities() -- CompatibilityGate checks these
+# against what a checkpoint's action actually needs (see
+# policy_semantics/compatibility_gate.py's backend_capabilities check).
+BACKEND_CAPABILITIES = {
+    "supports_cartesian_translation": True,
+    "supports_cartesian_rotation": True,
+    "supports_gripper": True,
+    "rotation_representation": "axis_angle",
+    "reference_frame": "robot_base",
+}
 
 ARM_JOINT_FORCES = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
 FINGER_FORCE = 20.0
@@ -80,6 +111,14 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
         self.end_effector_link_index = 11  # panda_grasptarget
 
         self.default_orientation = None
+        # Tracks the *desired* (commanded) orientation across repeated
+        # apply_command() calls, composed purely from deltas -- never
+        # re-read from the physics sim's noisy "achieved" orientation.
+        # Same reasoning apply_command()'s existing position handling
+        # already documents for position drift, extended to rotation:
+        # composing against a re-read achieved value would let per-call
+        # IK convergence error accumulate across many calls.
+        self._goal_orientation = None
 
         self._table_id = None
         self._object_id = None
@@ -137,6 +176,7 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             p.stepSimulation(physicsClientId=self.client_id)
 
         _, self.default_orientation = self._get_ee_pose()
+        self._goal_orientation = self.default_orientation
 
         self._object_id = self._create_box(
             half_extents=[0.02, 0.02, 0.02],
@@ -165,6 +205,22 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
     def apply_command(
         self, command: RobotCommand, steps: int = DEFAULT_MOVE_STEPS, step_delay: float = 0.0
     ) -> dict:
+        """Position keeps reading the physics sim's *achieved* EE position
+        each call (unaffected by this v2 change -- position IK converges
+        reliably enough that this has never shown the drift orientation
+        does). Rotation is now actually applied: RobotCommand.target_droll/
+        dpitch/dyaw is a [rx, ry, rz] axis-angle delta expressed in the
+        robot_base frame (this project's PyBullet base has identity
+        orientation relative to world, see class docstring, so base frame
+        == world frame here). It's composed against self._goal_orientation
+        (the last *commanded* orientation, not a re-read achieved one --
+        same drift-avoidance reasoning as the position-handling comment
+        this replaces) via quaternion pre-multiplication: new = delta ⊗
+        goal, confirmed to match robosuite's own
+        `goal_ori = rotation_mat_error @ curr_goal_ori` composition order
+        (robosuite/controllers/parts/arm/osc.py's compute_goal_ori()) --
+        see docs/panda_axis_cross_verification.md for how that order was
+        confirmed against PyBullet's own quaternion convention."""
         ee_position, _ = self._get_ee_pose()
 
         target_position = [
@@ -172,16 +228,15 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             ee_position[1] + command.target_dy,
             ee_position[2] + command.target_dz,
         ]
-        # v1: orientation deltas (target_droll/dpitch/dyaw) are ignored.
-        # Anchor to the fixed self.default_orientation (via
-        # target_orientation=None) rather than re-reading "current"
-        # orientation each call: numerical IK doesn't perfectly preserve
-        # orientation step to step, and an online control loop calling
-        # apply_command() many times in a row (unlike the few large
-        # single-shot moves in the scripted demos) lets that per-call
-        # error compound into a large drift that can stall further
-        # motion -- confirmed by reproducing it with ~30 repeated calls.
-        self.move_end_effector_to(target_position, steps=steps, step_delay=step_delay)
+
+        rotation_delta = (command.target_droll, command.target_dpitch, command.target_dyaw)
+        current_goal_orientation = self._goal_orientation or self.default_orientation
+        target_orientation = self._compose_orientation_delta(current_goal_orientation, rotation_delta)
+        self._goal_orientation = target_orientation
+
+        self.move_end_effector_to(
+            target_position, target_orientation=target_orientation, steps=steps, step_delay=step_delay
+        )
 
         if command.gripper_command == "open":
             self.open_gripper()
@@ -189,6 +244,37 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             self.close_gripper()
 
         return self.get_state()
+
+    @staticmethod
+    def _compose_orientation_delta(current_quat: list, axis_angle_delta) -> list:
+        """current_quat ⊗-composed with a [rx, ry, rz] axis-angle delta
+        (radians, robot_base frame), pre-multiplied (delta on the left --
+        matches robosuite's compute_goal_ori() order, confirmed via
+        docs/panda_axis_cross_verification.md). Clamps the delta's
+        magnitude to MAX_ROTATION_DELTA_RAD first (defense-in-depth on
+        top of PandaCommandSafetyFilter's own clip). A near-zero delta
+        returns current_quat unchanged (no-op, not an identity-quaternion
+        round-trip that could introduce floating-point drift)."""
+        rx, ry, rz = axis_angle_delta
+        angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+        if angle < 1e-9:
+            return current_quat
+
+        clamped_angle = max(-MAX_ROTATION_DELTA_RAD, min(MAX_ROTATION_DELTA_RAD, angle))
+        axis = [rx / angle, ry / angle, rz / angle]
+        delta_quat = p.getQuaternionFromAxisAngle(axis, clamped_angle)
+        _, new_quat = p.multiplyTransforms([0, 0, 0], delta_quat, [0, 0, 0], current_quat)
+        return list(new_quat)
+
+    def get_capabilities(self) -> dict:
+        """Static capability declaration this project's
+        CompatibilityGate checks against a checkpoint's manifest before
+        allowing full production compatibility -- see
+        policy_semantics/compatibility_gate.py's backend_capabilities
+        check and policy_semantics/manifest.py's PANDA_TARGET_EMBODIMENT.
+        Not state (doesn't touch the sim), just a fixed declaration of
+        what this backend implementation supports."""
+        return dict(BACKEND_CAPABILITIES)
 
     def move_end_effector_to(
         self,
@@ -406,6 +492,13 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             "last_event": self._last_event,
             "safety_reason": self.last_safety_reason,
             "blocked_action": self.last_blocked_action,
+            # Always False for this backend (v2 -- rotation is genuinely
+            # applied, see apply_command()) -- present so callers/logs
+            # have a single, always-present field to check rather than
+            # inferring support from backend type. A backend that can't
+            # apply rotation should set this True whenever it drops one,
+            # never silently.
+            "rotation_ignored": False,
         }
 
     def close(self) -> None:
