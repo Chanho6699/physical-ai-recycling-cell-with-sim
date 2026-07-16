@@ -72,6 +72,28 @@ FINGER_FORCE = 20.0
 FINGER_OPEN_POSITION = 0.04
 FINGER_CLOSE_POSITION = 0.0
 
+# Redundant-actuation guard for apply_command()'s gripper dispatch (see
+# its docstring): open_gripper()/close_gripper() each block for
+# DEFAULT_GRIPPER_STEPS (60) physics steps, and ActionAdapter.convert()
+# thresholds every action into "open" or "close" (never a no-op/hold --
+# see action_adapter/adapter_v0.py), so without this guard every single
+# apply_command() call re-runs a full 60-step actuation even when the
+# gripper is already exactly where the command wants it. Only a single
+# threshold near FINGER_OPEN_POSITION is needed (no separate hysteresis
+# band): open_gripper()/close_gripper() always run to full IK/motor
+# convergence before returning (see DEFAULT_GRIPPER_STEPS), so finger
+# qpos is settled, not mid-transition, by the time this is checked again
+# next call -- there is no oscillation to debounce. The threshold is
+# deliberately anchored to "close enough to FINGER_OPEN_POSITION", not to
+# FINGER_CLOSE_POSITION, because closing on a grasped object stops the
+# fingers at the object's half-width (this project's object is a 0.04m-
+# wide box, so qpos settles near 0.02, not exactly FINGER_CLOSE_POSITION)
+# -- checking equality against FINGER_CLOSE_POSITION would fail to
+# recognize "already closed and holding" as closed, and would re-trigger
+# a full actuation on every frame of the lift/move-above-bin phases where
+# the policy keeps re-issuing "close" while already holding the object.
+GRIPPER_OPEN_QPOS_THRESHOLD = 0.035
+
 # Franka's common "ready" joint configuration (arm joints 1-7, radians).
 READY_JOINT_POSITIONS = [0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4]
 
@@ -270,12 +292,29 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             target_position, target_orientation=target_orientation, steps=steps, step_delay=step_delay
         )
 
-        if command.gripper_command == "open":
+        # Only actuate the gripper when the command would actually change
+        # its state -- see GRIPPER_OPEN_QPOS_THRESHOLD's docstring for why
+        # this is worth 60 physics steps every call otherwise, and why the
+        # check reads real finger qpos rather than trusting self._gripper_state
+        # (a cached label of the last-issued command, not a physical
+        # measurement).
+        if command.gripper_command == "open" and not self._is_gripper_open():
             self.open_gripper()
-        elif command.gripper_command == "close":
+        elif command.gripper_command == "close" and self._is_gripper_open():
             self.close_gripper()
 
         return self.get_state()
+
+    def _is_gripper_open(self) -> bool:
+        """True if both fingers are already at (approximately)
+        FINGER_OPEN_POSITION, read live from the physics sim -- see
+        GRIPPER_OPEN_QPOS_THRESHOLD's docstring for why this threshold
+        (not FINGER_CLOSE_POSITION-equality) is what distinguishes "open"
+        from "closed", including "closed and holding an object"."""
+        finger_states = p.getJointStates(self.robot_id, self.finger_joint_indices, physicsClientId=self.client_id)
+        left_qpos = finger_states[0][0]
+        right_qpos = finger_states[1][0]
+        return left_qpos >= GRIPPER_OPEN_QPOS_THRESHOLD and right_qpos >= GRIPPER_OPEN_QPOS_THRESHOLD
 
     @staticmethod
     def _compose_orientation_delta(current_quat: list, axis_angle_delta) -> list:
