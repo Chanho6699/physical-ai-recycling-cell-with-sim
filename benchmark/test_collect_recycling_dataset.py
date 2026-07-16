@@ -77,7 +77,7 @@ def main() -> None:
         dataset = make_dataset(dataset_root)
 
         # 1a. max_steps exceeded (normal conditions, just cut off early).
-        success, num_frames, final_status, final_phase = run_one_episode(
+        success, num_frames, final_status, final_phase, _timing_rows = run_one_episode(
             dataset, position, instruction, "plastic_bottle", max_steps=3, steps_per_action=40,
         )
         check("max_steps: episode does not succeed", not success, f"success={success}")
@@ -89,7 +89,7 @@ def main() -> None:
         # 1b. grasp failure: policy is lied to about object position, so the
         # real object is always outside GRASP_THRESHOLD -- close_gripper
         # phase can never observe held_object/task_status=="grasped".
-        success, num_frames, final_status, final_phase = run_one_episode(
+        success, num_frames, final_status, final_phase, _timing_rows = run_one_episode(
             dataset, position, instruction, "plastic_bottle", max_steps=60, steps_per_action=40,
             lie_object_position_offset=[0.35, 0.0, 0.0],
         )
@@ -104,7 +104,7 @@ def main() -> None:
         # "released", not "success"; held_object becomes False either way,
         # so the policy also naturally reaches done=True here (this case
         # doubles as a real, non-synthetic done_without_success example).
-        success, num_frames, final_status, final_phase = run_one_episode(
+        success, num_frames, final_status, final_phase, _timing_rows = run_one_episode(
             dataset, position, instruction, "plastic_bottle", max_steps=150, steps_per_action=40,
             lie_bin_position_offset=[0.35, 0.0, 0.0],
         )
@@ -116,7 +116,7 @@ def main() -> None:
         # 1d. synthetic done_without_success: force policy_output.done=True
         # at step 1, well before the real phase machine could ever reach
         # task_status=="success".
-        success, num_frames, final_status, final_phase = run_one_episode(
+        success, num_frames, final_status, final_phase, _timing_rows = run_one_episode(
             dataset, position, instruction, "plastic_bottle", max_steps=150, steps_per_action=40,
             force_done_after_step=1,
         )
@@ -128,7 +128,7 @@ def main() -> None:
 
         # 1e. Now a REAL success episode, right after 4 discarded failures --
         # confirms episode_index/frame_index numbering was not polluted.
-        success, num_frames, final_status, final_phase = run_one_episode(
+        success, num_frames, final_status, final_phase, _timing_rows = run_one_episode(
             dataset, position, instruction, "plastic_bottle", max_steps=150, steps_per_action=40,
         )
         check("control success: episode succeeds", success, f"success={success}")
@@ -207,7 +207,7 @@ def main() -> None:
             f"measured={measured['transition (close->open)']}",
         )
 
-        declared_fps = 20
+        declared_fps = 10  # collect_recycling_dataset.DEFAULT_FPS -- matches LIBERO's own training fps (see chat report item 4)
         libero_fps = 10.0
         print(f"PyBullet time_step = {time_step:.6f}s (1/240), steps_per_action = {steps_per_action}")
         for label, steps in measured.items():

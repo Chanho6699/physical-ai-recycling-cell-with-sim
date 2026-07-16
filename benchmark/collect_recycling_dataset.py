@@ -9,6 +9,18 @@ add_frame()/save_episode() -- no hand-written parquet, no custom
 schema. Failed episodes are discarded (clear_episode_buffer()), never
 written to disk.
 
+Also writes timing/frame_timing.jsonl next to the dataset root (one row
+per SAVED frame): measured simulation_steps_elapsed/simulated_duration_s/
+cumulative_simulated_time_s per frame (real p.stepSimulation() counts,
+not estimates from command type -- see _FrameInstrumentation), since
+apply_command()'s gripper redundant-actuation fix means physics duration
+per frame is no longer constant (~40 steps on a "hold" frame, ~100 on a
+gripper-transition frame -- see this task's chat report). This sidecar
+is purely additive: it never touches the official data/meta/ LeRobot
+schema, and (like collection_manifest.jsonl) only ever contains rows
+from episodes that were actually save_episode()'d -- a failed episode's
+timing rows are discarded together with its LeRobot buffer.
+
 This is data collection ONLY: no fine-tuning is run here, no
 checkpoint/production file is modified. See this task's final report
 (chat) for how the produced dataset lines up with
@@ -41,6 +53,7 @@ from typing import Optional
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+import robot_sim.pybullet_panda_backend as pybullet_panda_backend
 from action_adapter.adapter_v0 import ActionAdapter
 from policy.dummy_openvla_policy import DummyOpenVLAPolicy
 from policy.policy_types import PolicyInput
@@ -50,7 +63,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_REPO_ID = "local/recycling_cell_v0"
 DEFAULT_ROOT = "datasets/recycling_lerobot_v0"
-DEFAULT_FPS = 20
+# Was 20 (v0). Measured real cadence (see timing/frame_timing.jsonl and
+# this task's chat report) is ~6.0Hz on hold frames, ~2.4Hz on gripper-
+# transition frames, ~5.5Hz blended over a typical episode -- 20 was
+# never defensible (3.6x too fast even against the best case). 10
+# matches HuggingFaceVLA/smolvla_libero's own declared training fps
+# (meta/info.json's fps=10.0), which is the more useful nominal value
+# for a fine-tuning pipeline (keeps this dataset's declared per-frame
+# time scale consistent with what the checkpoint already learned from)
+# and is within 2x of our real blended cadence, unlike 20's 3.6x-6x
+# error. The exact, non-uniform real duration per frame remains fully
+# recoverable from timing/frame_timing.jsonl regardless of what nominal
+# fps is declared here -- this value is a compatibility choice for the
+# official metadata, not a claim that cadence is actually uniform.
+DEFAULT_FPS = 10
 DEFAULT_OBJECT_TYPE = "plastic_bottle"
 DEFAULT_MAX_STEPS_PER_EPISODE = 150
 # Was 10 (v0). PyBulletPandaBackend.apply_command() used to always re-run
@@ -188,6 +214,60 @@ def jitter_position(position, rng: Optional[random.Random]):
     ]
 
 
+class _FrameInstrumentation:
+    """Collector-only physics-step instrumentation (no production file
+    touched): counts real p.stepSimulation() calls per apply_command(),
+    and flags whether THIS frame's apply_command() actually actuated the
+    gripper -- by wrapping the specific backend instance's own
+    open_gripper()/close_gripper() bound methods, not the class, so no
+    other backend instance or production call path is affected. Used to
+    populate timing/frame_timing.jsonl's simulation_steps_elapsed/
+    gripper_transition fields with MEASURED values, not estimates from
+    command type alone (a "close" command while already closed measures
+    0 extra steps -- see the redundant-actuation fix)."""
+
+    def __init__(self, backend: PyBulletPandaBackend):
+        self.backend = backend
+        self.step_count = 0
+        self.gripper_actuated = False
+        self._original_step = pybullet_panda_backend.p.stepSimulation
+        self._original_open = backend.open_gripper
+        self._original_close = backend.close_gripper
+
+    def __enter__(self):
+        def counting_step(*args, **kwargs):
+            self.step_count += 1
+            return self._original_step(*args, **kwargs)
+
+        def counted_open(*args, **kwargs):
+            self.gripper_actuated = True
+            return self._original_open(*args, **kwargs)
+
+        def counted_close(*args, **kwargs):
+            self.gripper_actuated = True
+            return self._original_close(*args, **kwargs)
+
+        pybullet_panda_backend.p.stepSimulation = counting_step
+        self.backend.open_gripper = counted_open
+        self.backend.close_gripper = counted_close
+        return self
+
+    def __exit__(self, *exc_info):
+        pybullet_panda_backend.p.stepSimulation = self._original_step
+        self.backend.open_gripper = self._original_open
+        self.backend.close_gripper = self._original_close
+
+    def consume_frame(self, time_step: float):
+        """Returns (simulation_steps_elapsed, simulated_duration_s,
+        gripper_transition) for the frame just completed, and resets the
+        per-frame counters for the next one."""
+        steps = self.step_count
+        gripper_transition = self.gripper_actuated
+        self.step_count = 0
+        self.gripper_actuated = False
+        return steps, steps * time_step, gripper_transition
+
+
 def run_one_episode(
     dataset,
     position,
@@ -198,6 +278,9 @@ def run_one_episode(
     lie_object_position_offset=None,
     lie_bin_position_offset=None,
     force_done_after_step=None,
+    instruction_name=None,
+    seed=None,
+    split=None,
 ):
     """Runs one full scripted episode, add_frame()-ing every step into
     the dataset's CURRENT episode buffer -- but never calling
@@ -241,47 +324,78 @@ def run_one_episode(
     num_frames = 0
     final_status = state["task_status"]
     final_phase = policy.phase
-    for step_index in range(max_steps):
-        main_image = backend.render_main_camera()
-        wrist_image = backend.render_wrist_camera()
-        state_8d = backend.get_libero_observation_state()
-        robot_state = backend.get_state()
+    timing_rows = []
+    cumulative_simulated_time_s = 0.0
+    with _FrameInstrumentation(backend) as instrumentation:
+        for step_index in range(max_steps):
+            main_image = backend.render_main_camera()
+            wrist_image = backend.render_wrist_camera()
+            state_8d = backend.get_libero_observation_state()
+            robot_state = backend.get_state()
 
-        policy_input = PolicyInput(
-            image=main_image,
-            instruction=instruction,
-            robot_state=robot_state,
-            task_goal={},
-            target_object_position=policy_target_object_position,
-            bin_position=policy_bin_position,
-            step_index=step_index,
-            phase=policy.phase,
-        )
-        policy_output = policy.predict_action(policy_input)
-        if force_done_after_step is not None and step_index >= force_done_after_step:
-            policy_output.done = True
-        robot_command = action_adapter.convert(policy_output.action)
+            policy_input = PolicyInput(
+                image=main_image,
+                instruction=instruction,
+                robot_state=robot_state,
+                task_goal={},
+                target_object_position=policy_target_object_position,
+                bin_position=policy_bin_position,
+                step_index=step_index,
+                phase=policy.phase,
+            )
+            policy_output = policy.predict_action(policy_input)
+            if force_done_after_step is not None and step_index >= force_done_after_step:
+                policy_output.done = True
+            robot_command = action_adapter.convert(policy_output.action)
 
-        dataset.add_frame(
-            {
-                "observation.images.image": main_image,
-                "observation.images.image2": wrist_image,
-                "observation.state": np.array(state_8d, dtype=np.float32),
-                "action": np.array(policy_output.action, dtype=np.float32),
-                "task": instruction,
-            }
-        )
-        num_frames += 1
+            dataset.add_frame(
+                {
+                    "observation.images.image": main_image,
+                    "observation.images.image2": wrist_image,
+                    "observation.state": np.array(state_8d, dtype=np.float32),
+                    "action": np.array(policy_output.action, dtype=np.float32),
+                    "task": instruction,
+                }
+            )
+            num_frames += 1
+            # This frame's observation was captured at cumulative_simulated_time_s
+            # (elapsed simulated time since episode start, measured -- not
+            # frame_index/fps); simulation_steps_elapsed/simulated_duration_s
+            # below describe the apply_command() call that takes the sim from
+            # THIS frame's state to the next one, matching LeRobot's own
+            # add_frame() timestamp convention ("when was this observation
+            # captured") but with a real, non-uniform clock.
+            frame_timestamp_s = cumulative_simulated_time_s
 
-        robot_state_after = backend.apply_command(robot_command, steps=steps_per_action)
-        final_status = robot_state_after["task_status"]
-        final_phase = policy.phase
-        if final_status == "success" or policy_output.done:
-            success = final_status == "success"
-            break
+            robot_state_after = backend.apply_command(robot_command, steps=steps_per_action)
+            simulation_steps_elapsed, simulated_duration_s, gripper_transition = instrumentation.consume_frame(
+                backend.time_step
+            )
+            cumulative_simulated_time_s += simulated_duration_s
+
+            timing_rows.append({
+                "frame_index": step_index,
+                "action_index": step_index,
+                "simulation_steps_elapsed": simulation_steps_elapsed,
+                "simulated_duration_s": simulated_duration_s,
+                "cumulative_simulated_time_s": frame_timestamp_s,
+                "gripper_transition": gripper_transition,
+                "gripper_command": robot_command.gripper_command,
+                "object_position": list(position),
+                "instruction": instruction,
+                "instruction_name": instruction_name,
+                "seed": seed,
+                "split": split,
+            })
+
+            final_status = robot_state_after["task_status"]
+            final_phase = policy.phase
+            if final_status == "success" or policy_output.done:
+                success = final_status == "success"
+                break
 
     backend.shutdown()
-    return success, num_frames, final_status, final_phase
+    return success, num_frames, final_status, final_phase, timing_rows
 
 
 _FORCE_FAILURE_KWARGS = {
@@ -332,6 +446,17 @@ def main() -> None:
     # used only by benchmark/analyze_recycling_dataset.py's quality
     # report. Written next to (never inside) data/meta/, so it can't be
     # confused with or corrupt the official parquet files.
+    #
+    # timing/frame_timing.jsonl is a SEPARATE sidecar with a different
+    # granularity/purpose: collection_manifest is one row per EPISODE
+    # (attempt-level condition + outcome); frame_timing is one row per
+    # FRAME (measured physics-step/duration timing), so downstream
+    # analysis doesn't have to guess which rows belong together. Both are
+    # written next to (never inside) data/meta/ -- the official LeRobot
+    # schema is untouched by either.
+    timing_dir = root / "timing"
+    timing_dir.mkdir(parents=True, exist_ok=True)
+    frame_timing_path = timing_dir / "frame_timing.jsonl"
 
     saved_episodes = 0
     success_count = 0
@@ -339,7 +464,8 @@ def main() -> None:
 
     print(f"=== Collecting {args.episodes} successful episodes -> {root} (split={args.split}) ===")
     try:
-        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file, \
+             open(frame_timing_path, "w", encoding="utf-8") as timing_file:
             while saved_episodes < args.episodes and attempt < max_attempts:
                 position_name, anchor_position = positions[attempt % len(positions)]
                 instruction_name, instruction = instructions[attempt % len(instructions)]
@@ -352,13 +478,25 @@ def main() -> None:
                 position = jitter_position(anchor_position, rng)
                 attempt += 1
 
-                success, num_frames, final_status, final_phase = run_one_episode(
+                success, num_frames, final_status, final_phase, timing_rows = run_one_episode(
                     dataset, position, instruction, args.object_type,
                     max_steps, args.steps_per_action, **fault_kwargs,
+                    instruction_name=instruction_name, seed=episode_seed, split=args.split,
                 )
 
                 if success:
                     dataset.save_episode()
+                    # timing_rows is only persisted HERE, after save_episode()
+                    # succeeds -- episode_index is only known now (LeRobot
+                    # assigns it in save order, 0-based, matching saved_episodes
+                    # before incrementing). A failed episode's timing_rows is
+                    # simply never written -- garbage-collected along with the
+                    # rest of that attempt's local state, exactly mirroring
+                    # clear_episode_buffer()'s discard of the LeRobot buffer.
+                    episode_index = saved_episodes
+                    for row in timing_rows:
+                        timing_file.write(json.dumps({"episode_index": episode_index, **row}) + "\n")
+                    timing_file.flush()
                     saved_episodes += 1
                     success_count += 1
                 else:
@@ -396,6 +534,7 @@ def main() -> None:
     )
     print(f"Dataset root: {root}")
     print(f"Manifest: {manifest_path}")
+    print(f"Frame timing: {frame_timing_path}")
     if saved_episodes < args.episodes:
         print(f"WARNING: only {saved_episodes}/{args.episodes} requested episodes were saved (hit --max-attempts={max_attempts}).")
 
