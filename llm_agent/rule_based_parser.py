@@ -80,12 +80,19 @@ class RuleBasedTaskParser:
 # (plastic_bottle/plastic_cup) describe Real2Sim sim_object_type values,
 # not the VLA-instruction-oriented ids used by RuleBasedTaskParser.
 NL_OBJECT_TABLE: List[dict] = [
-    {"keywords": ["플라스틱 병", "페트병", "병"], "id": "plastic_bottle"},
-    {"keywords": ["플라스틱 컵", "컵"], "id": "plastic_cup"},
+    # English keywords added so instructions can be compared cross-language
+    # (e.g. benchmark/run_smolvla_language_comparison_eval.py) -- this
+    # parser gates target_object/target_bin selection for the whole demo
+    # (see RuleBasedTaskGoalParser.parse() below), so an English
+    # instruction that only this table doesn't recognize would fail before
+    # ever reaching the VLA server, making it look like a VLA-language
+    # difference when it was actually just this table being Korean-only.
+    {"keywords": ["플라스틱 병", "페트병", "병", "plastic bottle", "bottle"], "id": "plastic_bottle"},
+    {"keywords": ["플라스틱 컵", "컵", "plastic cup", "cup"], "id": "plastic_cup"},
 ]
 
 NL_BIN_TABLE: List[dict] = [
-    {"keywords": ["플라스틱 수거함", "플라스틱 통"], "id": "plastic_bin"},
+    {"keywords": ["플라스틱 수거함", "플라스틱 통", "plastic bin", "plastic recycling bin", "recycling bin", "bin"], "id": "plastic_bin"},
 ]
 
 
@@ -116,9 +123,14 @@ class RuleBasedTaskGoalParser:
 
     @staticmethod
     def _match_id(command: str, table: List[dict]) -> Optional[str]:
+        # .lower() is a no-op on Korean text (no case) and makes the new
+        # English keywords above tolerant of "Bottle"/"BIN"/etc. -- avoids
+        # a purely-cosmetic capitalization difference silently failing
+        # the whole demo the way an unrecognized instruction does.
+        command_lower = command.lower()
         for entry in table:
             for keyword in entry["keywords"]:
-                if keyword in command:
+                if keyword.lower() in command_lower:
                     return entry["id"]
         return None
 

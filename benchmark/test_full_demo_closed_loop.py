@@ -107,6 +107,7 @@ class FakeRecorder:
 def make_args(**overrides) -> SimpleNamespace:
     defaults = dict(
         instruction="pick up the bottle",
+        policy="dummy-openvla",
         policy_backend="real-vla",
         policy_server_url="http://127.0.0.1:8000/predict",
         policy_request_timeout=5.0,
@@ -115,6 +116,10 @@ def make_args(**overrides) -> SimpleNamespace:
         real_vla_observation_mode="pybullet",
         strict_real_vla=False,
         control_loop_timeout_s=120.0,
+        seed=None,
+        eval_log_path=None,
+        workspace_bounds="-0.1,0.9,-0.7,0.7,0.0,1.0",
+        runaway_window=4,
         policy_observation_source="none",
         record_policy_observations=False,
         record_images=False,

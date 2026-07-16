@@ -117,6 +117,11 @@ class PredictRequest(BaseModel):
     # PyBulletPandaBackend.render_main_camera()/render_wrist_camera()).
     images: Optional[Dict[str, ImagePayload]] = None
     action_schema: Optional[dict] = None
+    # Optional per-step RNG seed (see policy/policy_types.py's
+    # PolicyInput.seed) -- only meaningful to model_family="smolvla"'s
+    # _run_smolvla_libero_inference(), which calls torch.manual_seed(seed)
+    # right before sampling if present. None (default): no seeding.
+    seed: Optional[int] = None
 
 
 class PredictResponse(BaseModel):
@@ -195,6 +200,7 @@ def predict(req: PredictRequest):
         "phase": req.phase,
         "observation_source": req.observation_source,
         "visual_observation": req.visual_observation,
+        "seed": req.seed,
     }
 
     model_input = _ADAPTER.build_model_input(policy_input_dict)

@@ -34,6 +34,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -197,6 +198,58 @@ def parse_args() -> argparse.Namespace:
             "(run_dummy_openvla_policy), independent of --max-policy-steps -- aborts with "
             "RuntimeError if exceeded (e.g. a hung/unreachable VLA server), so a broken "
             "connection can't spin forever."
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Forwarded to the VLA server every step as step-specific seed+step_index (see "
+            "policy/policy_types.py's PolicyInput.seed) so SmolVLA's flow-matching noise "
+            "sampling is reproducible -- e.g. running the same scene/instruction twice, or "
+            "comparing a Korean vs. English instruction with the model's own sampling "
+            "stochasticity held fixed instead of being a confound. None (default): no seeding."
+        ),
+    )
+    parser.add_argument(
+        "--eval-log-path",
+        type=str,
+        default=None,
+        help=(
+            "If set, append one JSON line per step (this run's real_vla_step_log, only "
+            "populated under --real-vla-observation-mode pybullet) to this file -- lets two "
+            "separate runs (e.g. Korean vs. English instruction) be compared after the fact "
+            "without re-parsing stdout. See benchmark/run_smolvla_language_comparison_eval.py."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-bounds",
+        type=str,
+        default="-0.1,0.9,-0.7,0.7,0.0,1.0",
+        help=(
+            "x_min,x_max,y_min,y_max,z_min,z_max (meters, robot_base frame) -- only enforced "
+            "under --real-vla-observation-mode pybullet. If the end effector leaves this box "
+            "after applying a command, the episode ends immediately "
+            "(task_status='aborted_workspace_exceeded') rather than continuing to drive an "
+            "arm that has left its intended operating volume. Generous by construction (this "
+            "project's table spans roughly x:[0,0.7] y:[-0.3,0.6], Panda's own reach is ~0.85m "
+            "from its base at the origin) -- this is a coarse safety net, not a precise limit."
+        ),
+    )
+    parser.add_argument(
+        "--runaway-window",
+        type=int,
+        default=4,
+        help=(
+            "Only enforced under --real-vla-observation-mode pybullet. If the last N "
+            "(this value) applied translation commands all point in nearly the same direction "
+            "(pairwise cosine similarity > 0.95) AND the EE-to-object distance did not "
+            "decrease at all over that window, the episode ends immediately "
+            "(task_status='aborted_runaway_same_direction') -- catches a policy that keeps "
+            "pushing the arm the same way without actually approaching the object, rather than "
+            "letting it spend the whole step budget on that. Set to 0 to disable."
         ),
     )
 
@@ -562,6 +615,110 @@ def blocked_state(state: dict, action_name: str, reason: str) -> dict:
     return final_state
 
 
+def aborted_state(state: dict, status: str, reason: str) -> dict:
+    """Early-termination state for --real-vla-observation-mode pybullet's
+    workspace-bounds/runaway-direction guards (see parse_args()'
+    --workspace-bounds/--runaway-window) -- a deliberate stop, distinct
+    from blocked_state() (SafetyGate) and from a genuine grasp/place
+    success (task_status == "success"), so callers/log readers never
+    mistake "we stopped the eval early for safety" for either of those."""
+    final_state = dict(state)
+    final_state["task_status"] = status
+    final_state["last_event"] = f"eval_guard_aborted:{status}"
+    final_state["safety_reason"] = reason
+    return final_state
+
+
+def parse_workspace_bounds(bounds_str: str) -> tuple:
+    parts = [float(part) for part in bounds_str.split(",")]
+    if len(parts) != 6:
+        raise ValueError(f"--workspace-bounds must have 6 comma-separated values, got {bounds_str!r}")
+    x_min, x_max, y_min, y_max, z_min, z_max = parts
+    return (x_min, x_max, y_min, y_max, z_min, z_max)
+
+
+def _distance_3d(a, b) -> float:
+    return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+
+
+def _unit_vector(vector) -> Optional[list]:
+    norm = math.sqrt(sum(component * component for component in vector))
+    if norm < 1e-9:
+        return None
+    return [component / norm for component in vector]
+
+
+def _cosine_similarity(a, b) -> Optional[float]:
+    unit_a = _unit_vector(a)
+    unit_b = _unit_vector(b)
+    if unit_a is None or unit_b is None:
+        return None
+    return sum(unit_a[i] * unit_b[i] for i in range(3))
+
+
+def build_real2sim_sync_info(
+    real2sim_mode: str,
+    task_frame_hash: str,
+    external_camera_frame_path: Optional[str],
+    mapping_debug: dict,
+    marker_detections: Optional[dict],
+    detection,
+    sim_position: list,
+    pybullet_object_position: list,
+) -> dict:
+    """One-time record of how this episode's object position was set from
+    the external camera (webcam/--camera-url iVCam, ArUco or ROI mapping)
+    -- built once in main() right after backend.set_object_position(),
+    then merged into every VLA step's real_vla_step_log by
+    run_dummy_openvla_policy() (see its real2sim_sync_info parameter).
+    Its presence/sync_locked=True at every step is the actual proof this
+    demo's sync policy holds: the external camera is consulted here
+    exactly once, before backend.reset()/set_object_position(), and the
+    VLA control loop below never calls set_object_position() again --
+    every step only ever reads backend.render_main_camera()/
+    render_wrist_camera()/get_libero_observation_state()."""
+    position_match = pybullet_object_position is not None and all(
+        abs(sim_position[i] - pybullet_object_position[i]) < 1e-6 for i in range(3)
+    )
+    sync_locked = position_match
+    if sync_locked:
+        sync_locked_reason = (
+            "real2sim mapping applied exactly once via backend.set_object_position() before the VLA control "
+            "loop started; the loop only reads backend.render_main_camera()/render_wrist_camera()/"
+            "get_libero_observation_state() and never calls set_object_position() again, so the external "
+            "camera/ArUco/ROI pipeline is never consulted again once control begins."
+        )
+    else:
+        sync_locked_reason = (
+            f"mapped_position={sim_position} does not match the PyBullet object's actual position "
+            f"{pybullet_object_position} -- sync lock NOT established, refusing to proceed."
+        )
+
+    return {
+        "real2sim_mode": real2sim_mode,
+        "external_camera_frame_hash": task_frame_hash,
+        "external_camera_frame_path": external_camera_frame_path,
+        "detected_marker_ids": mapping_debug.get("detected_marker_ids") if real2sim_mode == "aruco" else None,
+        "marker_corners_px": (
+            {str(marker_id): info["corners"] for marker_id, info in marker_detections.items()}
+            if real2sim_mode == "aruco" and marker_detections is not None
+            else None
+        ),
+        "homography_valid": mapping_debug.get("homography_valid") if real2sim_mode == "aruco" else None,
+        "yolo_label": detection.label,
+        "yolo_confidence": detection.confidence,
+        "yolo_bbox_xyxy": list(detection.bbox_xyxy),
+        "bbox_center_px": mapping_debug.get("bbox_center_px"),
+        "mapped_position_raw": mapping_debug.get("mapped_position_raw", sim_position),
+        "mapped_position": sim_position,
+        "out_of_bounds": mapping_debug.get("out_of_bounds", False),
+        "pybullet_object_position": pybullet_object_position,
+        "position_match": position_match,
+        "sync_locked": sync_locked,
+        "sync_locked_reason": sync_locked_reason,
+    }
+
+
 def run_scripted_policy(
     args,
     backend,
@@ -639,6 +796,7 @@ def run_dummy_openvla_policy(
     wrist_camera=None,
     hand_intrusion_gate=None,
     hand_safety_frame_provider=None,
+    real2sim_sync_info=None,
 ):
     action_adapter = ActionAdapter()
     policy = create_policy_backend(args)
@@ -654,7 +812,10 @@ def run_dummy_openvla_policy(
         "last_main_image_hash": None,
         "last_wrist_image_hash": None,
         "last_state_8d": None,
+        "last_postprocessed_action": None,
     }
+    workspace_bounds = parse_workspace_bounds(args.workspace_bounds)
+    runaway_tracker = {"translation_history": [], "distance_to_object_history": []}
 
     state = backend.get_state()
     target_object_position = list(sim_position)
@@ -670,6 +831,14 @@ def run_dummy_openvla_policy(
         "recorded_wrist_observation_steps": 0,
     }
     policy_backend_state = {
+        # --policy selects which control-loop *shape* runs (this function
+        # vs. run_scripted_policy) -- entirely independent of
+        # --policy-backend (which selects what actually computes each
+        # action: DummyOpenVLAPolicy/FastAPIVLAPolicyClient/
+        # RealVLAPolicyClient). Both surfaced explicitly here since
+        # "--policy dummy-openvla --policy-backend real-vla" reads as
+        # contradictory at a glance if you don't already know the split.
+        "control_loop": args.policy,
         "policy_backend": args.policy_backend,
         "policy_server_url": args.policy_server_url if args.policy_backend == "fastapi-dummy" else None,
         "fallback_backend": None,
@@ -681,8 +850,19 @@ def run_dummy_openvla_policy(
     }
     if args.policy_backend == "real-vla":
         policy_backend_state["policy_server_url"] = getattr(policy, "server_url", None)
-        policy_backend_state["fallback_backend"] = args.real_vla_fallback_backend
+        # --strict-real-vla always forces the actual fallback_policy to
+        # None (see create_policy_backend()) regardless of
+        # --real-vla-fallback-backend -- report "none" here too, so the
+        # final summary never shows e.g. fallback_backend: local-dummy as
+        # if it were actually available/usable when it wasn't.
+        policy_backend_state["fallback_backend"] = "none" if args.strict_real_vla else args.real_vla_fallback_backend
         policy_backend_state["action_schema"] = (getattr(policy, "action_schema", {}) or {}).get("type")
+        # Read straight from the loaded config (RealVLAPolicyClient.
+        # model_id_or_path) rather than waiting for the server to report
+        # it in info["model"] -- that key is never actually set by any
+        # adapter (only info["model_family"]/["adapter_used"] are), so
+        # this previously stayed None all the way to the final summary.
+        policy_backend_state["model"] = getattr(policy, "model_id_or_path", None)
     inference_latencies_ms = []
     image_encoding_latencies_ms = []
 
@@ -927,6 +1107,7 @@ def run_dummy_openvla_policy(
             observation_source=observation_source,
             visual_observation=visual_observation,
             images_by_role=images_by_role,
+            seed=(args.seed + step_index) if args.seed is not None else None,
         )
         policy_output = policy.predict_action(policy_input)
         robot_command = action_adapter.convert(policy_output.action)
@@ -966,30 +1147,88 @@ def run_dummy_openvla_policy(
             real_vla_observation_state["last_state_8d"] = state_8d
 
             action_postprocess_info = policy_output_info.get("action_postprocess") or {}
+            canonical_command_after = action_postprocess_info.get("canonical_command") or {}
+            canonical_command_before = action_postprocess_info.get("canonical_command_pre_safety_filter")
+            canonical_metadata = canonical_command_after.get("metadata") or {}
+
+            # Ground-truth distances (from the sim, not the perception
+            # estimate target_object_position was derived from) -- lets
+            # the eval loop say "is the EE actually getting closer to the
+            # real object" regardless of how good the upstream detection/
+            # real2sim mapping was.
+            ee_position_now = list(state_8d[0:3])
+            object_position_now = list(robot_state.get("object_position") or [0.0, 0.0, 0.0])
+            distance_to_object = _distance_3d(ee_position_now, object_position_now)
+            distance_to_bin = _distance_3d(ee_position_now, list(bin_position))
+
+            # Action repetition / magnitude-of-change: policy_output.action
+            # is the flat 7D [dx,dy,dz,droll,dpitch,dyaw,gripper] this
+            # step actually applies (post-adapter, post-safety-filter,
+            # same shape regardless of model_family) -- comparing it
+            # directly to the previous step's is a model-agnostic way to
+            # notice "the policy is outputting the same thing every step
+            # regardless of what it's shown."
+            current_action_vector = list(policy_output.action)
+            previous_action_vector = real_vla_observation_state["last_postprocessed_action"]
+            if previous_action_vector is not None:
+                action_delta_norm = math.sqrt(
+                    sum(
+                        (current_action_vector[i] - previous_action_vector[i]) ** 2
+                        for i in range(len(current_action_vector))
+                    )
+                )
+            else:
+                action_delta_norm = None
+            action_repeated = action_delta_norm is not None and action_delta_norm < 1e-4
+            real_vla_observation_state["last_postprocessed_action"] = current_action_vector
+
             real_vla_step_log = {
                 "episode_id": episode_id,
                 "step_id": step_index,
                 "observation_timestamp": observation_timestamp,
+                "instruction": args.instruction,
                 "main_image_hash": main_image_hash,
                 "wrist_image_hash": wrist_image_hash,
                 "state_8d": state_8d,
                 "observation_repeated": observation_repeated,
                 "server_latency_ms": inference_latency_ms,
-                "canonical_command": action_postprocess_info.get("canonical_command"),
+                "raw_model_action_7d": canonical_metadata.get("raw_model_action"),
+                "postprocessed_action_7d": canonical_metadata.get("native_action_raw_values"),
+                "applied_action_7d": current_action_vector,
+                "canonical_command_before_safety_filter": canonical_command_before,
+                "canonical_command_after_safety_filter": canonical_command_after,
+                "safety_filter_clipped": action_postprocess_info.get("safety_filter_clipped"),
                 "safety_clipped": action_postprocess_info.get("safety_clipped"),
+                "ee_position": ee_position_now,
+                "ee_orientation_axis_angle": list(state_8d[3:6]),
+                "distance_to_object_m": distance_to_object,
+                "distance_to_bin_m": distance_to_bin,
+                "gripper_command": robot_command.gripper_command,
+                "action_delta_norm": action_delta_norm,
+                "action_repeated": action_repeated,
                 "compatibility_passed": compatibility_passed,
                 "semantic_action_valid": semantic_action_valid,
                 "degraded_input": degraded_input,
                 "fallback_used": fallback_used,
                 "real_vla_request_failed": real_vla_request_failed,
+                # One-time real2sim provenance (external camera -> ArUco/ROI
+                # -> PyBullet object position), repeated on every step so a
+                # log reader can confirm sync_locked=True held for the
+                # entire run and was never re-derived from the external
+                # camera mid-episode -- see build_real2sim_sync_info().
+                "real2sim_sync": real2sim_sync_info,
             }
             print(
-                f"[step {step_index:02d}] real_vla_observation: "
-                f"main_hash={main_image_hash} wrist_hash={wrist_image_hash} "
-                f"repeated={observation_repeated} compatibility_passed={compatibility_passed} "
+                f"[step {step_index:02d}] real_vla: dist_obj={distance_to_object:.3f} dist_bin={distance_to_bin:.3f} "
+                f"gripper_cmd={robot_command.gripper_command} action_delta={action_delta_norm} "
+                f"repeated={action_repeated} compatibility_passed={compatibility_passed} "
                 f"semantic_action_valid={semantic_action_valid} degraded_input={degraded_input} "
                 f"fallback_used={fallback_used}"
             )
+
+            if args.eval_log_path:
+                with open(resolve(args.eval_log_path), "a", encoding="utf-8") as eval_log_file:
+                    eval_log_file.write(json.dumps(to_jsonable(real_vla_step_log), ensure_ascii=False) + "\n")
 
             if args.strict_real_vla:
                 strict_violations = []
@@ -1087,7 +1326,74 @@ def run_dummy_openvla_policy(
             # was actually applied to the sim (item: "post-apply EE
             # pose/gripper state" in the required logging fields).
             real_vla_step_log["post_apply_ee_position"] = list(state["end_effector_position"])
+            real_vla_step_log["post_apply_gripper_width"] = state.get("gripper_width")
             real_vla_step_log["post_apply_gripper_state"] = state.get("gripper_state")
+
+            # --- eval-mode early-abort guards (only under --real-vla-observation-mode
+            # pybullet; disabled by default for the legacy/scripted/local-dummy paths) ---
+            ee_position_after = list(state["end_effector_position"])
+            x_min, x_max, y_min, y_max, z_min, z_max = workspace_bounds
+            workspace_exceeded = not (
+                x_min <= ee_position_after[0] <= x_max
+                and y_min <= ee_position_after[1] <= y_max
+                and z_min <= ee_position_after[2] <= z_max
+            )
+            if workspace_exceeded:
+                reason = f"EE position {ee_position_after} left --workspace-bounds {args.workspace_bounds}"
+                print(f"[step {step_index:02d}] ABORTED (workspace_exceeded): {reason}")
+                final_state = aborted_state(state, "aborted_workspace_exceeded", reason)
+                if recorder is not None:
+                    recorder.record_step(
+                        phase=policy_output.phase,
+                        action_name="aborted_workspace_exceeded",
+                        robot_state=final_state,
+                        action={"type": "openvla_style", "vector": policy_output.action, "info": policy_output.info},
+                        safety=safety_record,
+                        image=task_frame if args.record_images else None,
+                        extra=step_extra,
+                    )
+                return with_wrist_refinement_info(final_state), step_index + 1
+
+            if args.runaway_window > 0:
+                object_position_after = list(state.get("object_position") or [0.0, 0.0, 0.0])
+                distance_to_object_after = _distance_3d(ee_position_after, object_position_after)
+                translation_vector = [robot_command.target_dx, robot_command.target_dy, robot_command.target_dz]
+                runaway_tracker["translation_history"].append(translation_vector)
+                runaway_tracker["distance_to_object_history"].append(distance_to_object_after)
+
+                window = args.runaway_window
+                if len(runaway_tracker["translation_history"]) >= window:
+                    recent_translations = runaway_tracker["translation_history"][-window:]
+                    recent_distances = runaway_tracker["distance_to_object_history"][-window:]
+                    similarities = [
+                        _cosine_similarity(recent_translations[i], recent_translations[i + 1])
+                        for i in range(len(recent_translations) - 1)
+                    ]
+                    same_direction = all(similarity is not None and similarity > 0.95 for similarity in similarities)
+                    distance_not_decreased = recent_distances[-1] >= recent_distances[0] - 1e-6
+                    if same_direction and distance_not_decreased:
+                        reason = (
+                            f"last {window} steps' translation commands all pointed the same direction "
+                            f"(min pairwise cosine similarity={min(similarities):.3f}) and distance_to_object "
+                            f"did not decrease ({recent_distances[0]:.3f} -> {recent_distances[-1]:.3f})"
+                        )
+                        print(f"[step {step_index:02d}] ABORTED (runaway_same_direction): {reason}")
+                        final_state = aborted_state(state, "aborted_runaway_same_direction", reason)
+                        if recorder is not None:
+                            recorder.record_step(
+                                phase=policy_output.phase,
+                                action_name="aborted_runaway_same_direction",
+                                robot_state=final_state,
+                                action={
+                                    "type": "openvla_style",
+                                    "vector": policy_output.action,
+                                    "info": policy_output.info,
+                                },
+                                safety=safety_record,
+                                image=task_frame if args.record_images else None,
+                                extra=step_extra,
+                            )
+                        return with_wrist_refinement_info(final_state), step_index + 1
 
         distance_to_target = (policy_output.info or {}).get("distance_to_target")
         dist_str = f"{distance_to_target:.3f}" if distance_to_target is not None else "n/a"
@@ -1179,6 +1485,14 @@ def main() -> None:
 
     print(f"frame shape: {task_frame.shape}")
     print(f"frame dtype: {task_frame.dtype}")
+    # Identity of the one external-camera frame this whole episode's
+    # real2sim mapping is based on -- logged once here and carried into
+    # every VLA step's log via real2sim_sync_info (see
+    # build_real2sim_sync_info()) so a log reader can confirm the VLA
+    # loop's own PyBullet camera hashes (main_image_hash/wrist_image_hash)
+    # are a DIFFERENT, fresh set of hashes every step, never this one.
+    task_frame_hash = hashlib.sha1(task_frame.tobytes()).hexdigest()[:12]
+    print(f"frame_hash: {task_frame_hash}")
 
     detector = ONNXYOLODetector(model_path=str(model_path), confidence_threshold=args.confidence_threshold)
     detections = detector.detect(task_frame)
@@ -1201,6 +1515,7 @@ def main() -> None:
     print(f"{detection.label} (confidence={detection.confidence:.2f}) -> {sim_object_type}")
 
     image_height, image_width = task_frame.shape[:2]
+    marker_detections = None
 
     if args.real2sim_mode == "aruco":
         try:
@@ -1240,6 +1555,20 @@ def main() -> None:
         if sim_position is None:
             print("FAIL")
             return
+
+        # Hard-enforced here regardless of --aruco-calibration's own
+        # out_of_bounds_policy (which defaults to "reject" already, but
+        # could be set to "clamp"/"allow" for other, non-VLA uses of this
+        # same calibration file) -- this demo's strict requirement is
+        # out_of_bounds=false, full stop, not "clamped into range".
+        if mapping_debug.get("out_of_bounds"):
+            print(
+                "FAIL -- ArUco-mapped position is out_of_bounds "
+                f"(mapped_position_raw={mapping_debug.get('mapped_position_raw')}, "
+                f"workspace_bounds={mapping_debug.get('workspace_bounds')}). This demo requires a real, "
+                "in-workspace mapping; re-place the object or adjust configs/real2sim_aruco_table_calibration.json."
+            )
+            return
     else:
         sim_mapper = CalibratedImageToSimMapper.from_config_file(resolve(args.real2sim_calibration))
         sim_position, mapping_debug = sim_mapper.map_bbox_to_sim(detection.bbox_xyxy, image_width, image_height)
@@ -1278,16 +1607,18 @@ def main() -> None:
             return
 
         print(f"policy_backend: real-vla ({real_vla_health_client.server_url})")
+        print(f"active_model_id: {real_vla_health_client.model_id_or_path}")
+        effective_fallback = "none" if args.strict_real_vla else args.real_vla_fallback_backend
         try:
             health = real_vla_health_client.check_health()
             print(f"Real VLA policy server health: {health}")
         except RuntimeError as exc:
-            if args.real_vla_fallback_backend == "none":
+            if effective_fallback == "none":
                 print(str(exc))
                 print("FAIL")
                 return
             print(f"Real VLA policy server unreachable: {exc}")
-            print(f"Continuing with --real-vla-fallback-backend={args.real_vla_fallback_backend} at runtime.")
+            print(f"Continuing with --real-vla-fallback-backend={effective_fallback} at runtime.")
 
     safety_gate = build_safety_gate(args, model_path)
 
@@ -1319,6 +1650,24 @@ def main() -> None:
         print(state)
 
         bin_position = state["bin_position"]
+
+        real2sim_sync_info = build_real2sim_sync_info(
+            real2sim_mode=args.real2sim_mode,
+            task_frame_hash=task_frame_hash,
+            external_camera_frame_path=(
+                args.image_path if args.image_source == "image" else saved_webcam_frame_path
+            ),
+            mapping_debug=mapping_debug,
+            marker_detections=marker_detections,
+            detection=detection,
+            sim_position=sim_position,
+            pybullet_object_position=state["object_position"],
+        )
+        print("=== Real2Sim Sync Lock ===")
+        print(real2sim_sync_info)
+        if not real2sim_sync_info["sync_locked"]:
+            print("FAIL")
+            return
 
         if recorder is not None:
             recorder.start_episode(
@@ -1359,6 +1708,21 @@ def main() -> None:
                     robot_id=backend.robot_id,
                     config_path=resolve(args.wrist_camera_config),
                 )
+                if args.wrist_camera_mode == "refine" and args.real_vla_observation_mode == "pybullet":
+                    # refine_target_with_wrist_camera() below only ever
+                    # updates target_object_position (DummyOpenVLAPolicy's
+                    # own scripted-heuristic target) -- it never calls
+                    # backend.set_object_position(), so real2sim's sync
+                    # lock (see build_real2sim_sync_info()) is unaffected
+                    # either way. Still off by default (--wrist-camera-mode
+                    # default="off") and printed here so turning it on
+                    # doesn't get mistaken for "re-locating the object from
+                    # the external camera."
+                    print(
+                        "Note: --wrist-camera-mode refine only adjusts DummyOpenVLAPolicy's own scripted "
+                        "target_object_position estimate -- it does not move the real2sim-mapped PyBullet "
+                        "object and does not affect real2sim_sync_info.sync_locked."
+                    )
 
         if args.safety_mode == "pause-resume" and args.policy != "dummy-openvla":
             print("--safety-mode pause-resume is only wired into --policy dummy-openvla; ignoring for scripted.")
@@ -1391,6 +1755,7 @@ def main() -> None:
                 wrist_camera=wrist_camera,
                 hand_intrusion_gate=hand_intrusion_gate,
                 hand_safety_frame_provider=hand_safety_frame_provider,
+                real2sim_sync_info=real2sim_sync_info,
             )
 
         print("\n=== Final State ===")
@@ -1439,8 +1804,8 @@ def main() -> None:
                 )
 
         print("\n=== Full Demo Finished ===")
-        print(f"policy: {args.policy}")
-        print(f"policy_backend: {final_state.get('policy_backend', args.policy_backend)}")
+        print(f"control_loop: {final_state.get('control_loop', args.policy)} (loop shape only, not the inference source)")
+        print(f"policy_backend: {final_state.get('policy_backend', args.policy_backend)} (what actually computed each action)")
         print(f"policy_steps: {policy_steps}")
         print(f"final_status: {final_status}")
         print(f"last_event: {final_state['last_event']}")

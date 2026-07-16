@@ -31,6 +31,14 @@ class PolicyInput:
     # changing what single-camera callers (mock-action, smolvla_base)
     # already do.
     images_by_role: Optional[dict] = None
+    # Forwarded to the VLA server so it can seed its own model-side RNG
+    # (e.g. SmolVLA's flow-matching noise sampling, see
+    # vla_server/model_loader.py's torch.manual_seed(seed) call) right
+    # before this step's inference call -- lets two runs with different
+    # instructions (e.g. Korean vs. English wording) be compared without
+    # the model's own sampling stochasticity being a confound. None (the
+    # default) means "don't seed, let it sample freely".
+    seed: Optional[int] = None
 
 
 @dataclass

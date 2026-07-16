@@ -162,5 +162,16 @@ class SmolVLALiberoActionAdapter(ActionAdapter):
                 "control_freq_hz": LIBERO_CONTROL_FREQ_HZ,
                 "gripper_raw": raw_gripper,
                 "gripper_convention": "robosuite PandaGripper.format_action(): -1=open, 1=closed",
+                # Forwarded from NativePolicyAction.metadata (set by
+                # vla_server/model_loader.py's _run_smolvla_libero_inference)
+                # -- the truly raw, pre-official-postprocessor model tensor
+                # and which images/state source were actually used this
+                # step. Without this, CanonicalRobotCommand.to_info_dict()
+                # only ever showed the post-postprocessor action
+                # (native_action_raw_values above), never what the model
+                # itself actually output before unnormalization.
+                "raw_model_action": native_action.metadata.get("raw_model_action"),
+                "images_source": native_action.metadata.get("images_source"),
+                "state_source": native_action.metadata.get("state_source"),
             },
         )

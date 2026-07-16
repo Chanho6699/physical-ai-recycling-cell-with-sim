@@ -56,6 +56,13 @@ class RealVLAPolicyClient(BasePolicy):
         self.timeout = float(self.config.get("timeout_sec", 10.0))
         self.request_schema = self.config.get("request_schema", {}) or {}
         self.action_schema = self.config.get("action_schema", {}) or {}
+        # Read straight from config rather than a server round-trip --
+        # run_full_recycling_cell_demo.py's final summary was previously
+        # showing "model: None" because info["model"] is never actually
+        # set by the server (only info["model_family"]/["adapter_used"]
+        # are); this is the one place the client already knows which
+        # checkpoint it's configured to talk to.
+        self.model_id_or_path = self.config.get("model_id_or_path")
         self.fallback_policy = fallback_policy
 
         self.phase = "move_to_object"
@@ -108,6 +115,8 @@ class RealVLAPolicyClient(BasePolicy):
             # still gets one. See vla_server/generic_vla_server.py's
             # PredictRequest.images.
             payload["images"] = images_by_role_payload
+        if policy_input.seed is not None:
+            payload["seed"] = policy_input.seed
         if self.request_schema.get("include_robot_state", True):
             payload["robot_state"] = policy_input.robot_state
         if self.request_schema.get("include_task_goal", True):

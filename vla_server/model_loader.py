@@ -1043,6 +1043,20 @@ def _run_smolvla_libero_inference(model, preprocessor_pipeline, postprocessor_pi
     model_dtype, model_device = _resolve_model_dtype_device(model, configured_dtype, device)
     batch = _align_batch_dtype_device(batch, model_dtype, model_device)
 
+    # Optional per-step seed (see policy/policy_types.py's PolicyInput.seed)
+    # -- SmolVLA's action head samples from noise (sample_noise() in
+    # lerobot's modeling_smolvla.py, torch.normal(...)) each call, so two
+    # calls with identical batch content still produce different actions
+    # unless the RNG is pinned first. Only affects this process's global
+    # torch RNG state for this one call -- callers wanting reproducible
+    # comparisons (e.g. Korean vs. English instruction wording) should
+    # pass the same seed value for the same step_index across runs.
+    seed = model_input.get("seed")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
     with torch.inference_mode():
         raw_action = model.select_action(batch)
 

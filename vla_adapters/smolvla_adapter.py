@@ -112,6 +112,7 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
             "robot_state": policy_input_dict.get("robot_state") or {},
             "step_index": policy_input_dict.get("step_index", 0),
             "phase": policy_input_dict.get("phase"),
+            "seed": policy_input_dict.get("seed"),
             "model_id_or_path": self.config.get("model_id_or_path", "unknown"),
         }
 
@@ -156,6 +157,14 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
                     compatibility,
                 )
 
+            # Captured before PandaCommandSafetyFilter.apply() below so
+            # the response can show both sides of that clip -- this is
+            # the SmolVLALiberoActionAdapter-decoded command (translation/
+            # rotation already scaled into meters/radians, gripper
+            # already converted to gripper_opening_01), not yet clipped
+            # to this project's own configured per-step step-size limits.
+            pre_safety_filter_command = canonical_command.to_info_dict()
+
             filter_result = self._safety_filter.apply(canonical_command)
             if not filter_result.accepted:
                 return self._reject(
@@ -166,6 +175,8 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
             action = canonical_command.to_legacy_action_list()
             debug = {
                 "canonical_command": canonical_command.to_info_dict(),
+                "canonical_command_pre_safety_filter": pre_safety_filter_command,
+                "safety_filter_clipped": filter_result.clipped,
                 "safety_clipped": canonical_command.safety_clipped,
                 "degraded_input": canonical_command.degraded_input,
             }
