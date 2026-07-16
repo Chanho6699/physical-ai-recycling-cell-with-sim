@@ -77,9 +77,15 @@ def main() -> None:
     backend.apply_command(close_command, steps=30)
     state_closed = backend.get_libero_observation_state()
     left_delta = state_open[6] - state_closed[6]
-    right_delta = state_open[7] - state_closed[7]
+    # state[7] (the second gripper channel) is negated in
+    # get_libero_observation_state() to match
+    # HuggingFaceVLA/smolvla_libero's training-time sign convention (see
+    # that method's docstring) -- it moves from strongly negative (open,
+    # ~-0.04) toward ~0 (closed), i.e. it INCREASES on close, the
+    # opposite direction of the (unnegated) left channel.
+    right_delta = state_closed[7] - state_open[7]
     check("left finger qpos decreased on close", left_delta > 0.01, f"open={state_open[6]}, closed={state_closed[6]}")
-    check("right finger qpos decreased on close", right_delta > 0.01, f"open={state_open[7]}, closed={state_closed[7]}")
+    check("right finger qpos (negated) increased on close", right_delta > 0.01, f"open={state_open[7]}, closed={state_closed[7]}")
     backend.shutdown()
     print()
 
@@ -172,6 +178,94 @@ def main() -> None:
         result = subprocess.run([_sys.executable, "-m", module], capture_output=True, text=True)
         passed = "ALL CHECKS PASSED" in result.stdout
         check(f"{module} -- ALL CHECKS PASSED", passed, result.stdout[-800:] if not passed else "")
+    print()
+
+    print("=== 10. gripper channel-2 sign convention (production fix regression) ===")
+    # Confirms get_libero_observation_state()'s minimal fix: the second
+    # gripper channel (state[-1]) is negated to match
+    # HuggingFaceVLA/smolvla_libero's training-time convention (verified
+    # directly against real HuggingFaceVLA/libero dataset samples --
+    # see that method's docstring and
+    # benchmark/run_gripper_channel_sign_ab_experiment.py), while the
+    # first channel (state[-2]) and everything else (field order/shape,
+    # action adapter, gripper open/close execution) stay unchanged.
+    backend = fresh_backend()
+    state_open = backend.get_libero_observation_state()
+    check("shape is still exactly 8", len(state_open) == 8, f"got {len(state_open)}")
+    check(
+        "open: state[-2] > 0 and state[-1] < 0 (first channel unnegated, second negated)",
+        state_open[-2] > 0 and state_open[-1] < 0,
+        f"state[-2:]={state_open[-2:]}",
+    )
+    check(
+        "open: abs(state[-2]) and abs(state[-1]) correspond within tolerance "
+        "(both fingers move symmetrically -- only the sign of the second differs)",
+        abs(abs(state_open[-2]) - abs(state_open[-1])) < 1e-3,
+        f"abs(state[-2])={abs(state_open[-2])} abs(state[-1])={abs(state_open[-1])}",
+    )
+
+    close_command = RobotCommand(
+        target_dx=0.0, target_dy=0.0, target_dz=0.0, target_droll=0.0, target_dpitch=0.0, target_dyaw=0.0,
+        gripper_command="close",
+    )
+    backend.apply_command(close_command, steps=30)
+    state_closed = backend.get_libero_observation_state()
+    check(
+        "closed: the two channels still have opposite signs (or the negated one is ~0, never positive-and-large)",
+        state_closed[-2] >= -1e-3 and state_closed[-1] <= 1e-3,
+        f"state[-2:]={state_closed[-2:]}",
+    )
+    check(
+        "closed: abs(state[-2]) and abs(state[-1]) still correspond within tolerance",
+        abs(abs(state_closed[-2]) - abs(state_closed[-1])) < 1e-3,
+        f"abs(state[-2])={abs(state_closed[-2])} abs(state[-1])={abs(state_closed[-1])}",
+    )
+    check(
+        "existing gripper open/close EXECUTION is unchanged -- backend.get_state()['gripper_state'] still "
+        "reports 'close' (this fix only touches the observation-building return value, never joint control)",
+        backend.get_state()["gripper_state"] == "close",
+    )
+    backend.shutdown()
+
+    fresh_reset_backend = fresh_backend()
+    reset_state = fresh_reset_backend.get_libero_observation_state()
+    check(
+        "sign convention already holds immediately after reset() (not just after some motion)",
+        reset_state[-2] > 0 and reset_state[-1] < 0,
+        f"state[-2:]={reset_state[-2:]}",
+    )
+    fresh_reset_backend.shutdown()
+
+    # action_adapter/gripper-command EXECUTION path is untouched: convert
+    # a canned 7-float action through the same, unmodified ActionAdapter
+    # and confirm the resulting RobotCommand/gripper_command still work
+    # exactly as before (this fix never touches action_adapter/adapter_v0.py).
+    from action_adapter.adapter_v0 import ActionAdapter
+
+    action_adapter = ActionAdapter()
+    close_action_command = action_adapter.convert([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    open_action_command = action_adapter.convert([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    check(
+        "ActionAdapter's own gripper-command conversion is unaffected (still 1.0=close, 0.0=open)",
+        close_action_command.gripper_command == "close" and open_action_command.gripper_command == "open",
+    )
+
+    # production 코드가 diagnostic helper에 의존하지 않음 (production code does not
+    # depend on any diagnostic helper) -- grep-based, not "trust me".
+    import re
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[1]
+    production_dirs = ["robot_sim", "vla_server", "policy_semantics", "vla_adapters", "policy"]
+    diagnostic_module_pattern = re.compile(r"\bbenchmark\.(run|test)_[a-z_]*diagnostic[a-z_]*\b")
+    hits = []
+    for directory in production_dirs:
+        for path in (project_root / directory).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if ("import " in line and diagnostic_module_pattern.search(line)) or "apply_gripper_condition(" in line or "apply_coordinate_hypothesis(" in line:
+                    hits.append(f"{path.relative_to(project_root)}:{line_no}")
+    check("no production file imports/calls any diagnostic-only helper", len(hits) == 0, f"unexpected: {hits}")
     print()
 
     print("=" * 60)

@@ -317,12 +317,45 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
         p.getAxisAngleFromQuaternion() and scaled by angle, the same
         [axis * angle] convention CanonicalRobotCommand.rotation_axis_angle_rad
         already uses, so this state and that command share one
-        representation), left finger joint position, right finger joint
-        position (both meters, panda_finger_joint1/2 -- see
-        finger_joint_indices). This project's PyBullet base has identity
-        orientation relative to world (see class docstring), so
-        world-frame == robot_base-frame here, same as apply_command()'s
-        translation/rotation deltas."""
+        representation), left finger joint position, **negated** right
+        finger joint position (both meters, panda_finger_joint1/2 -- see
+        finger_joint_indices and the sign-convention note below). This
+        project's PyBullet base has identity orientation relative to
+        world (see class docstring), so world-frame == robot_base-frame
+        here, same as apply_command()'s translation/rotation deltas.
+
+        Gripper channel sign convention (observation only -- see note
+        below): HuggingFaceVLA/smolvla_libero was trained on robosuite's
+        Panda gripper MJCF (robosuite/models/assets/grippers/panda_gripper.xml),
+        whose two finger joints have OPPOSITE-signed ranges by
+        construction -- finger_joint1 range="0.0 0.04", finger_joint2
+        range="-0.04 0.0" -- so robosuite's raw robot0_gripper_qpos
+        sensor (a plain, unmodified MuJoCo qpos read, see
+        robosuite/robots/robot.py) is naturally [+q, -q]. Confirmed
+        directly against real HuggingFaceVLA/libero training samples
+        (data/chunk-000/file-000.parquet): observation.state's last two
+        dims are always opposite-signed and near-equal in magnitude at
+        every timestep, open or closed. PyBullet's bundled
+        franka_panda/panda.urdf models BOTH finger joints with the same
+        positive-only range [0, 0.04] -- there is no matching
+        negative-range joint to read here, so the second channel is
+        negated at this single point (the observation-building boundary)
+        to reproduce the checkpoint's training-time sign convention.
+        This is purely a state/observation fix, separate from and does
+        not touch: the underlying PyBullet joint position itself
+        (self._gripper_state / p.getJointStates() below still reads the
+        real, unmodified, positive joint value), open_gripper()/
+        close_gripper()'s control logic, CanonicalRobotCommand, or
+        action_adapter's gripper-command conversion (all of those
+        concern the action/command side, whose own gripper polarity
+        question -- see canonical_command.py's module docstring -- is
+        entirely independent of this observation-side one). Verified via
+        a controlled A/B experiment (see benchmark/
+        run_gripper_channel_sign_ab_experiment.py) to measurably reduce
+        premature/oscillating gripper-close behavior; it did NOT resolve
+        the separate x/y translation direction bias found earlier (see
+        benchmark/run_counterfactual_direction_benchmark.py), which
+        remains open."""
         ee_position, ee_orientation_quat = self._get_ee_pose()
 
         axis, angle = p.getAxisAngleFromQuaternion(ee_orientation_quat)
@@ -340,7 +373,7 @@ class PyBulletPandaBackend(SimulatorBackend, RobotBackend):
             ee_orientation_axis_angle[1],
             ee_orientation_axis_angle[2],
             left_finger_qpos,
-            right_finger_qpos,
+            -right_finger_qpos,
         ]
 
     def render_main_camera(self, width: int = LIBERO_CAMERA_WIDTH, height: int = LIBERO_CAMERA_HEIGHT):
