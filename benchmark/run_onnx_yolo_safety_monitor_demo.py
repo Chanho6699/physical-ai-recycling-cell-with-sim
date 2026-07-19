@@ -57,7 +57,11 @@ def get_frame(args: argparse.Namespace, resources: dict) -> np.ndarray:
         resources["frame_source"] = source
         return source.get_frame()
 
-    image = Image.open(args.image_path).convert("RGB")
+    image_path = Path(args.image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+
+    image = Image.open(image_path).convert("RGB")
     return np.array(image, dtype=np.uint8)
 
 
@@ -76,6 +80,10 @@ def main() -> None:
             frame = get_frame(args, resources)
         except RuntimeError:
             print(WEBCAM_FAILURE_MESSAGE)
+            return
+        except FileNotFoundError as exc:
+            print(exc)
+            print("Check --image-path and try again.")
             return
 
         print(f"frame shape: {frame.shape}")

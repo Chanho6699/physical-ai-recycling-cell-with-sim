@@ -62,6 +62,7 @@ does this once at startup), not lazily on the first /predict.
 
 import os
 import threading
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from policy_semantics.compatibility_gate import CompatibilityGate, CompatibilityResult
@@ -365,31 +366,54 @@ def _load_smolvla(model_id_or_path: str, local_files_only: bool) -> dict:
     return get_state()
 
 
-# Only checkpoints explicitly confirmed to ship their own
-# policy_preprocessor.json/policy_postprocessor.json (+ baked-in
-# normalizer/unnormalizer .safetensors) get this treatment -- confirmed
-# for HuggingFaceVLA/smolvla_libero this session via
-# `HfApi().list_repo_files(...)`. Never attempted for an arbitrary/
-# unregistered model_id (a checkpoint without these files would just
-# fail the from_pretrained() call below, so this list is a deliberate
-# allowlist, not a strict requirement of the loader itself).
+# Explicit allowlist for HUB repo ids only (checking whether a Hub repo
+# actually ships these files needs a network call this loader
+# deliberately never makes speculatively for an arbitrary/unregistered
+# model_id -- see _has_official_processor_files_on_disk() for the local-
+# path case, which needs no such allowlist since the files are just
+# checked directly). Confirmed for HuggingFaceVLA/smolvla_libero this
+# session via `HfApi().list_repo_files(...)`.
 _MODELS_WITH_OFFICIAL_PROCESSOR_FILES = ("HuggingFaceVLA/smolvla_libero",)
+
+_OFFICIAL_PROCESSOR_FILENAMES = ("policy_preprocessor.json", "policy_postprocessor.json")
+
+
+def _has_official_processor_files_on_disk(model_id_or_path: str) -> bool:
+    """True iff model_id_or_path is a local directory that actually
+    contains both official processor config files -- checked directly on
+    disk, not guessed from a name. This is what lets ANY local checkpoint
+    (e.g. one this project fine-tuned itself via lerobot_train.py, which
+    always writes both files alongside the weights when a preprocessor/
+    postprocessor was used at train time -- see
+    lerobot/common/train_utils.py's save_checkpoint()) get its official
+    processors wired automatically, with no per-path allowlist entry
+    needed. Only applies to local directories; a Hub repo id (no local
+    directory of that name) always returns False here and falls through
+    to _MODELS_WITH_OFFICIAL_PROCESSOR_FILES instead."""
+    path = Path(model_id_or_path)
+    if not path.is_dir():
+        return False
+    return all((path / filename).is_file() for filename in _OFFICIAL_PROCESSOR_FILENAMES)
 
 
 def _load_official_smolvla_processors(model_id_or_path: str, local_files_only: bool):
     """Loads this checkpoint's own official pre/post-processor pipelines
     (LeRobot's PolicyProcessorPipeline.from_pretrained(), the same
-    mechanism lerobot-eval itself uses) if this exact model_id is known
-    to ship them -- see _MODELS_WITH_OFFICIAL_PROCESSOR_FILES. This is
-    what lets _run_smolvla_libero_inference() build a NativePolicyAction
-    with postprocessor_used=True (real unnormalization, not this
-    project's own manual batch-building from earlier turns) -- see
+    mechanism lerobot-eval itself uses) if this checkpoint is known (Hub
+    allowlist) or directly confirmed (local directory, see
+    _has_official_processor_files_on_disk()) to ship them. This is what
+    lets _run_smolvla_libero_inference() build a NativePolicyAction with
+    postprocessor_used=True (real unnormalization, not this project's own
+    manual batch-building from earlier turns) -- see
     policy_semantics/native_policy_action.py. Returns (None, None) if
-    this model_id isn't in the allowlist, or if loading fails for any
-    reason (never raises; a missing/broken official processor just
-    means official_processor_wired stays effectively False for this
-    load, which CompatibilityGate already accounts for)."""
-    if model_id_or_path not in _MODELS_WITH_OFFICIAL_PROCESSOR_FILES:
+    neither check passes, or if loading fails for any reason (never
+    raises; a missing/broken official processor just means
+    official_processor_wired stays effectively False for this load,
+    which CompatibilityGate already accounts for)."""
+    if (
+        model_id_or_path not in _MODELS_WITH_OFFICIAL_PROCESSOR_FILES
+        and not _has_official_processor_files_on_disk(model_id_or_path)
+    ):
         return None, None
     try:
         from lerobot.processor import PolicyProcessorPipeline

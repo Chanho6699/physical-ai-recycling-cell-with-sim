@@ -64,21 +64,39 @@ class DummyOpenVLAPolicy(BasePolicy):
         grasp_z_offset: float = DEFAULT_GRASP_Z_OFFSET,
         bin_open_distance_threshold: float = DEFAULT_BIN_OPEN_DISTANCE_THRESHOLD,
         max_move_above_bin_steps: int = DEFAULT_MAX_MOVE_ABOVE_BIN_STEPS,
+        stabilization_steps: int = 0,
+        stabilization_step_size: float = 0.01,
     ):
+        """stabilization_steps (default 0 -- IDENTICAL behavior to before
+        this parameter existed, every existing caller unaffected):
+        inserts a "stabilize" phase between move_to_object and
+        close_gripper, active only when > 0 -- see benchmark/
+        collect_v3_recovery_smoke.py's chat report (V3 Recovery Data
+        Collector task) for why: v2 training data was found to spend
+        essentially zero frames dwelling near the object before closing
+        (near_frames_in_last_5_before_close_mean ~1.0, see
+        results/dataset_analysis/v2_approach_coverage.md), so the smoke
+        collector needs a genuine, non-faked few-frame fine-correction
+        window here rather than an instant tolerance-crossing -> close
+        transition."""
         self.max_step_size = max_step_size
         self.position_tolerance = position_tolerance
         self.carry_height = carry_height
         self.grasp_z_offset = grasp_z_offset
         self.bin_open_distance_threshold = bin_open_distance_threshold
         self.max_move_above_bin_steps = max_move_above_bin_steps
+        self.stabilization_steps = stabilization_steps
+        self.stabilization_step_size = stabilization_step_size
         self.phase = "move_to_object"
         self.last_info: dict = {}
         self.move_above_bin_steps = 0
+        self.stabilization_counter = 0
 
     def reset(self) -> None:
         self.phase = "move_to_object"
         self.last_info = {}
         self.move_above_bin_steps = 0
+        self.stabilization_counter = 0
 
     def predict_action(self, policy_input: PolicyInput) -> PolicyOutput:
         """Thin wrapper around _predict_phase_action(): runs the actual
@@ -121,11 +139,45 @@ class DummyOpenVLAPolicy(BasePolicy):
             delta, distance = self._delta_to_target(current_ee, grasp_target)
             self.last_info = {"distance_to_target": distance, "target": grasp_target}
             if distance <= self.position_tolerance:
-                self.phase = "close_gripper"
+                if self.stabilization_steps > 0:
+                    self.phase = "stabilize"
+                    self.stabilization_counter = 0
+                else:
+                    self.phase = "close_gripper"
             else:
                 return PolicyOutput(
                     action=[delta[0], delta[1], delta[2], 0.0, 0.0, 0.0, 0.0],
                     phase="move_to_object",
+                    done=False,
+                    info=self.last_info,
+                )
+
+        if self.phase == "stabilize":
+            # A few genuine, smaller-magnitude corrective steps toward the
+            # grasp target (real delta each frame, NOT a copied zero-action
+            # -- see this method's own module-level "recovery" requirement)
+            # before transitioning to close_gripper. Distance naturally
+            # shrinks step over step as the residual error is corrected, so
+            # consecutive frames are NOT identical even though they all aim
+            # at the same fixed target.
+            grasp_target = self._grasp_target(policy_input.target_object_position)
+            raw_delta = [grasp_target[axis] - current_ee[axis] for axis in range(3)]
+            distance = math.sqrt(sum(component ** 2 for component in raw_delta))
+            clamped_delta = [
+                max(-self.stabilization_step_size, min(self.stabilization_step_size, component))
+                for component in raw_delta
+            ]
+            self.stabilization_counter += 1
+            self.last_info = {
+                "distance_to_target": distance, "target": grasp_target,
+                "stabilization_step": self.stabilization_counter,
+            }
+            if self.stabilization_counter >= self.stabilization_steps:
+                self.phase = "close_gripper"
+            else:
+                return PolicyOutput(
+                    action=[clamped_delta[0], clamped_delta[1], clamped_delta[2], 0.0, 0.0, 0.0, 0.0],
+                    phase="stabilize",
                     done=False,
                     info=self.last_info,
                 )

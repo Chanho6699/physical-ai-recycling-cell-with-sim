@@ -122,7 +122,22 @@ class SmolVLAActionAdapter(BaseVLAAdapter):
         step_index = context.get("step_index", 0)
         phase = context.get("phase") or "move_to_object"
         compatibility = context.get("compatibility") or {}
-        model_id = self.config.get("model_id_or_path", "unknown")
+        # compatibility["model_id"] (see policy_semantics.compatibility_gate
+        # .CompatibilityResult) is the model_id_or_path vla_server/model_loader.py
+        # actually resolved and loaded at load_model_once() time (env-var
+        # driven, see model_loader.resolve_model_id_or_path()) -- the
+        # authoritative source. self.config["model_id_or_path"] is only
+        # ever populated when a VLA_BACKEND_CONFIG_PATH JSON file
+        # separately declares that same key (most server launches, incl.
+        # the plain env-var-only ones this task's benchmarks use, never
+        # set one), so falling back to it first would silently resolve
+        # to "unknown" -> get_manifest("unknown") -> an all-UNKNOWN
+        # manifest -- harmless before this task's native-gripper-range
+        # fix (the old decode() never consulted manifest fields for its
+        # fixed (-1,1) formula), but decode() now genuinely depends on
+        # manifest.native_gripper_range being correct, so this ordering
+        # bug had to be fixed together with it.
+        model_id = compatibility.get("model_id") or self.config.get("model_id_or_path", "unknown")
 
         if compatibility.get("passed"):
             # Reached only once a checkpoint's manifest has actually

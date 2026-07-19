@@ -203,6 +203,57 @@ class CompatibilityGate:
             "against inventing a meter/radian scale factor ourselves",
         )
 
+        gripper_range = manifest.native_gripper_range
+        gripper_range_valid = gripper_range is not None and gripper_range[0] < gripper_range[1]
+        gripper_polarity_known = (
+            manifest.native_gripper_min_means != UNKNOWN
+            and manifest.native_gripper_max_means != UNKNOWN
+            and manifest.native_gripper_min_means != manifest.native_gripper_max_means
+        )
+        record(
+            "gripper_native_range_known",
+            # SmolVLALiberoActionAdapter.decode() (see
+            # policy_semantics/adapters/smolvla_libero_adapter.py) needs a
+            # real, valid (min < max) native range AND an unambiguous
+            # polarity to convert this checkpoint's own raw gripper output
+            # into CanonicalRobotCommand.gripper_opening_01 -- see this
+            # task's chat report for the confirmed bug this check exists
+            # to prevent: a checkpoint whose native scale differs from
+            # what a fixed formula assumes decodes its ENTIRE output range
+            # to a single constant command, regardless of what the model
+            # actually intends.
+            gripper_range_valid and gripper_polarity_known,
+            f"native_gripper_range={gripper_range!r}, "
+            f"native_gripper_min_means={manifest.native_gripper_min_means!r}, "
+            f"native_gripper_max_means={manifest.native_gripper_max_means!r} -- all three must be "
+            "known and min_means != max_means before this checkpoint's gripper output can be "
+            "safely decoded",
+        )
+
+        translation_rotation_scale_known = (
+            manifest.native_translation_scale_m is not None
+            and manifest.native_rotation_scale_rad is not None
+            and manifest.native_action_clip_range[0] < manifest.native_action_clip_range[1]
+        )
+        record(
+            "translation_rotation_scale_known",
+            # SmolVLALiberoActionAdapter.decode() needs to know how many
+            # physical meters/radians this checkpoint's native action
+            # unit represents before converting translation/rotation --
+            # see this task's chat report for the confirmed duplicate-
+            # scaling bug this check exists to prevent: a checkpoint
+            # whose own postprocessor already outputs real physical
+            # units (this project's own locally fine-tuned checkpoints)
+            # getting a SECOND, LIBERO-specific 0.05m/0.5rad multiply
+            # applied on top, shrinking every commanded step by ~20x.
+            translation_rotation_scale_known,
+            f"native_translation_scale_m={manifest.native_translation_scale_m!r}, "
+            f"native_rotation_scale_rad={manifest.native_rotation_scale_rad!r}, "
+            f"native_action_clip_range={manifest.native_action_clip_range!r} -- both scales must be "
+            "known and the clip range must be a valid (min < max) interval before this checkpoint's "
+            "translation/rotation output can be safely decoded",
+        )
+
         passed = all(check["passed"] for check in checks.values())
 
         return CompatibilityResult(
