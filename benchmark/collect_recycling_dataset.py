@@ -281,6 +281,7 @@ def run_one_episode(
     instruction_name=None,
     seed=None,
     split=None,
+    bin_position=None,
 ):
     """Runs one full scripted episode, add_frame()-ing every step into
     the dataset's CURRENT episode buffer -- but never calling
@@ -300,10 +301,26 @@ def run_one_episode(
     to fail deterministically for testing clear_episode_buffer(), without
     touching DummyOpenVLAPolicy/PyBulletPandaBackend/ActionAdapter
     themselves.
+
+    bin_position (default None, meaning "leave PyBulletPandaBackend's own
+    reset() default bin pose untouched" -- byte-for-byte the same
+    behavior every existing caller of this function already gets) lets a
+    caller move the REAL, PHYSICAL bin before the episode starts (via
+    backend.set_bin_position(), an existing production method -- see
+    this task's chat report on why train80's single, never-varied bin
+    position let the fine-tuned checkpoint learn a fixed release
+    timing/trajectory instead of genuinely conditioning on the bin's
+    visual position). DummyOpenVLAPolicy itself needs no change for
+    this: it already reads bin_position out of PolicyInput every step
+    (see policy/dummy_openvla_policy.py's move_above_bin phase), never a
+    hardcoded coordinate -- only this collection entry point never had a
+    way to tell the SIMULATOR to actually put the bin somewhere else.
     """
     backend = PyBulletPandaBackend(gui=False)
     state = backend.reset()
     backend.set_object_type(object_type)
+    if bin_position is not None:
+        state = backend.set_bin_position(list(bin_position))
     state = backend.set_object_position(list(position))
     bin_position = state["bin_position"]
 
