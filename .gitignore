@@ -41,6 +41,12 @@ weights/*.onnx
 weights/*.engine
 weights/*.task
 
+# Results / experiment outputs (local-only, like datasets/* below --
+# never versioned; regenerate via the benchmark/ scripts that produced
+# them instead of relying on git history)
+results/*
+!results/.gitkeep
+
 # Dataset
 datasets/*
 !datasets/.gitkeep
