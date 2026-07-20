@@ -39,6 +39,7 @@ Run:
 import argparse
 import json
 import math
+import random
 from pathlib import Path
 
 import pybullet as p
@@ -61,7 +62,7 @@ from benchmark.so101_scripted_expert import (
     So101ExpertError,
     run_pick_and_place_episode,
 )
-from robot_sim.so101_pybullet_backend import InvalidSceneLayoutError, So101PyBulletBackend
+from robot_sim.so101_pybullet_backend import DEFAULT_SCENE_CONFIG, InvalidSceneLayoutError, So101PyBulletBackend
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_JSON = "results/so101_bin_diagnostic_10seeds.json"
@@ -89,10 +90,64 @@ DIAGNOSTIC_OUTCOMES = [
     "object_not_below_rim", "object_not_settled", "unknown",
 ]
 
+# --- randomization_mode "fixed_bin_object_xy" (see this task's chat
+# report, "randomization 설계 변경") -- bin stays at a FIXED world
+# position every episode; only the object's own XY is randomized
+# (existing "coupled_small" mode -- bin_center = object_position +
+# offset, unchanged, still the CLI default -- is untouched). A
+# DEDICATED anchor offset/table footprint, separate from
+# DEFAULT_BIN_TARGET_ZONE_OFFSET_XY / DEFAULT_BIN_SURFACE_FOOTPRINT_XY
+# (robot_sim/so101_pybullet_backend.py), so this new mode cannot alter
+# the coupled mode's own bin position or table size.
+#
+# Derivation (see this task's chat report, "안전한 범위를 확정한다"):
+# object half-extent=0.02m, bin outer half-extent=0.07+0.004=0.074m ->
+# two axis-aligned boxes need >0.094m clearance on AT LEAST ONE axis to
+# never overlap. With the bin's Y anchored well away from the object's
+# nominal Y (0.0) and the object independently randomized within
+# +/-FIXED_BIN_OBJECT_Y_RANGE, the worst case is the object's Y at its
+# own extreme: anchor_y - Y_RANGE must stay > 0.094 with real margin,
+# not just barely over. anchor_y=0.13, Y_RANGE=0.015 ->
+# 0.13-0.015-0.094=+0.021m margin. The default table's Y half-extent
+# (DEFAULT_BIN_SURFACE_FOOTPRINT_XY=0.19) is also too tight for this
+# anchor (0.13+0.074=0.204 > 0.19), so this mode ALSO widens
+# surface_footprint_xy's Y half via the EXISTING scene_config override
+# mechanism (no backend change) -- 0.22 leaves 0.22-0.204=+0.016m
+# margin there too. X keeps the small offset the ORIGINAL coupled
+# design already validated for good IK convergence (see
+# DEFAULT_BIN_TARGET_ZONE_OFFSET_XY's own docstring: a y-dominant
+# split reaches with far better precision than an even x/y split).
+FIXED_BIN_MODE_ANCHOR_OFFSET_XY = [0.03, 0.13]
+FIXED_BIN_MODE_SURFACE_FOOTPRINT_XY = [0.19, 0.22]
+FIXED_BIN_OBJECT_X_RANGE = (-0.015, 0.015)
+FIXED_BIN_OBJECT_Y_RANGE = (-0.015, 0.015)
+
+# Object footprint is a SQUARE cross-section cube (object_footprint_xy
+# half-extents [0.02, 0.02], object_height=0.04 -- see
+# robot_sim/so101_pybullet_backend.py's own DEFAULT_SCENE_CONFIG), not
+# a cylinder -- yaw is NOT fully symmetric (only period-90-degree
+# symmetric), so a small yaw DOES change the rendered silhouette (see
+# this task's chat report, section 5). +/-12 degrees chosen as a small
+# perturbation well inside that 90-degree period.
+FIXED_BIN_OBJECT_YAW_RANGE_RAD = (-0.2094395102393195, 0.2094395102393195)  # +/-12 degrees
+
+RANDOMIZATION_MODE_COUPLED_SMALL = "coupled_small"
+RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY = "fixed_bin_object_xy"
+
 
 def resolve(path_str: str) -> Path:
     path = Path(path_str)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def sample_object_yaw_rad(seed: int, yaw_range_rad: tuple) -> float:
+    """Same deterministic pattern as
+    benchmark.evaluate_so101_expert_small_randomization.sample_object_position()
+    -- a fresh random.Random(seed) per call, so the same seed always
+    yields the same yaw. A separate Random instance from whatever
+    sample_object_position() itself used for this seed's x/y offset --
+    no shared state, so this can't disturb that draw."""
+    return random.Random(seed).uniform(yaw_range_rad[0], yaw_range_rad[1])
 
 
 def parse_seed_list(seeds_str: str) -> list:
@@ -111,11 +166,24 @@ def classify_exception_phase(phase: str) -> str:
     return "unknown"
 
 
-def run_single_seed_diagnostic(seed: int, x_range: tuple, y_range: tuple, gui: bool = False) -> dict:
+def run_single_seed_diagnostic(
+    seed: int, x_range: tuple, y_range: tuple, gui: bool = False,
+    randomization_mode: str = RANDOMIZATION_MODE_COUPLED_SMALL,
+    bin_center_override_xy: list = None, object_yaw_rad: float = None,
+    scene_config: dict = None,
+) -> dict:
     sampled_object_position = sample_object_position(seed, x_range, y_range)
-    record = {"seed": seed, "sampled_object_position": sampled_object_position}
+    record = {"seed": seed, "sampled_object_position": sampled_object_position, "randomization_mode": randomization_mode}
 
-    backend = So101PyBulletBackend(gui=gui, use_bin=True, object_position=sampled_object_position)
+    backend_kwargs = {"gui": gui, "use_bin": True, "object_position": sampled_object_position}
+    if bin_center_override_xy is not None:
+        backend_kwargs["bin_center_override_xy"] = bin_center_override_xy
+    if object_yaw_rad is not None:
+        backend_kwargs["object_yaw_rad"] = object_yaw_rad
+        record["sampled_object_yaw_rad"] = object_yaw_rad
+    if scene_config is not None:
+        backend_kwargs["scene_config"] = scene_config
+    backend = So101PyBulletBackend(**backend_kwargs)
     try:
         # --- reset() + scene validation (see this task's chat report,
         # "randomization으로 invalid layout이 발생한다면... scene_generation_invalid
@@ -544,6 +612,13 @@ def main() -> None:
     parser.add_argument("--x-range", type=str, default=f"{DEFAULT_X_RANGE[0]},{DEFAULT_X_RANGE[1]}")
     parser.add_argument("--y-range", type=str, default=f"{DEFAULT_Y_RANGE[0]},{DEFAULT_Y_RANGE[1]}")
     parser.add_argument("--output-json", type=str, default=DEFAULT_OUTPUT_JSON)
+    parser.add_argument(
+        "--mode", type=str, default=RANDOMIZATION_MODE_COUPLED_SMALL,
+        choices=[RANDOMIZATION_MODE_COUPLED_SMALL, RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY],
+        help="coupled_small (default, unchanged): bin_center = object_position + offset. "
+             "fixed_bin_object_xy: bin stays fixed, only object XY is independently randomized (see this task's chat report).",
+    )
+    parser.add_argument("--apply-yaw", action="store_true", help="only meaningful with --mode fixed_bin_object_xy -- also randomize object yaw within FIXED_BIN_OBJECT_YAW_RANGE_RAD")
     args = parser.parse_args()
 
     x_range = tuple(float(v) for v in args.x_range.split(","))
@@ -557,9 +632,28 @@ def main() -> None:
     else:
         seeds = list(range(args.seed_start, args.seed_start + args.num_seeds))
 
+    fixed_bin_kwargs = {}
+    if args.mode == RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY:
+        nominal_object_xy = DEFAULT_SCENE_CONFIG["surface_center_xy"]
+        fixed_bin_center_xy = [
+            nominal_object_xy[0] + FIXED_BIN_MODE_ANCHOR_OFFSET_XY[0], nominal_object_xy[1] + FIXED_BIN_MODE_ANCHOR_OFFSET_XY[1],
+        ]
+        fixed_bin_kwargs = {
+            "bin_center_override_xy": fixed_bin_center_xy,
+            "scene_config": {"surface_footprint_xy": FIXED_BIN_MODE_SURFACE_FOOTPRINT_XY},
+        }
+        if not args.seeds and args.x_range == f"{DEFAULT_X_RANGE[0]},{DEFAULT_X_RANGE[1]}":
+            x_range = FIXED_BIN_OBJECT_X_RANGE
+        if not args.seeds and args.y_range == f"{DEFAULT_Y_RANGE[0]},{DEFAULT_Y_RANGE[1]}":
+            y_range = FIXED_BIN_OBJECT_Y_RANGE
+        print(f"--mode fixed_bin_object_xy: fixed_bin_center_xy={fixed_bin_center_xy}, x_range={x_range}, y_range={y_range}, apply_yaw={args.apply_yaw}")
+
     records = []
     for seed in seeds:
-        record = run_single_seed_diagnostic(seed, x_range, y_range, gui=args.gui)
+        yaw = sample_object_yaw_rad(seed, FIXED_BIN_OBJECT_YAW_RANGE_RAD) if (args.mode == RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY and args.apply_yaw) else None
+        record = run_single_seed_diagnostic(
+            seed, x_range, y_range, gui=args.gui, randomization_mode=args.mode, object_yaw_rad=yaw, **fixed_bin_kwargs,
+        )
         records.append(record)
         outcome = record["diagnostic_outcome"]
         print(f"[seed {seed}] diagnostic_outcome={outcome}")

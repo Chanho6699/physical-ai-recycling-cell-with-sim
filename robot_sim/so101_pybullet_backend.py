@@ -130,12 +130,36 @@ BIN_ROLLING_FRICTION = 0.001
 BIN_SPINNING_FRICTION = 0.001
 BIN_RESTITUTION = 0.05
 
-# Bright, semi-transparent, and deliberately distinct from the existing
-# green target marker (see this task's own "기존 초록 target marker와
-# 구분될 것") -- light blue reads clearly against this scene's brown
-# table / blue object / green marker palette without being so dark it
-# occludes camera observation of whatever is inside the bin.
-BIN_COLOR_RGBA = [0.55, 0.75, 0.95, 0.85]
+# Table/object visual colors -- named here (not left as inline literals
+# at their _create_box() call sites) so a script measuring scene visual
+# salience (see benchmark/measure_so101_bin_visual_salience.py) can
+# import them instead of retyping the same numbers a second time.
+TABLE_COLOR_RGBA = [0.55, 0.35, 0.2, 1.0]
+OBJECT_COLOR_RGBA = [0.2, 0.6, 1.0, 1.0]
+
+# Opaque, high-saturation magenta -- deliberately OUTSIDE this scene's
+# existing blue/brown/gray palette (table is brown, object is blue,
+# the default ground plane checker is pale gray/blue, the flat mode's
+# own target marker is green), so the bin cannot be confused with any
+# of them by hue alone. The OLD value (light blue, alpha=0.85, kept
+# below commented out for the record) measured
+# bin_object_rgb_distance~=61 and bin_background_rgb_distance~=212 on
+# a 0-255*sqrt(3) scale (see
+# benchmark/measure_so101_bin_visual_salience.py's own "before" run,
+# results/so101_bin_visual_before_after/before/visibility_metrics.json)
+# -- low specifically against the object because both were in the same
+# blue hue family. This magenta was picked by computing straight-line
+# RGB distance against all three existing surface colors at once
+# (TABLE_COLOR_RGBA, OBJECT_COLOR_RGBA, and the pale background) and
+# choosing a hue far from all of them, not just the one this task's
+# report happened to flag first. alpha=1.0 (fully opaque) so the
+# wall's rendered edge is crisp instead of blended with whatever is
+# behind/inside it. Collision geometry (BIN_INNER_WIDTH_M/
+# BIN_WALL_HEIGHT_M/BIN_WALL_THICKNESS_M above) is UNCHANGED -- only
+# this rgbaColor value differs; see _create_box()'s own collision+
+# visual shapes, both still built from the exact same half_extents.
+# OLD_BIN_COLOR_RGBA_BEFORE_THIS_TASK = [0.55, 0.75, 0.95, 0.85]
+BIN_COLOR_RGBA = [0.9, 0.1, 0.6, 1.0]
 
 # --- Bin scene layout (see this task's chat report, "bin scene layout
 # 문제") --- DEFAULT_SCENE_CONFIG's own target_zone_offset_xy=[0.05, 0.05]
@@ -350,6 +374,7 @@ class So101PyBulletBackend:
         self, gui: bool = False, urdf_path=None, time_step: float = 1.0 / 240.0,
         object_position: Optional[list] = None, scene_config: Optional[dict] = None,
         use_bin: bool = False, show_target_marker: Optional[bool] = None,
+        bin_center_override_xy: Optional[list] = None, object_yaw_rad: Optional[float] = None,
     ):
         self.gui = gui
         self.urdf_path = Path(urdf_path) if urdf_path else DEFAULT_URDF_PATH
@@ -359,6 +384,24 @@ class So101PyBulletBackend:
         # for future object-position randomization (see this task's
         # chat report) -- reset() itself never rolls its own randomness.
         self._object_position_override = list(object_position) if object_position is not None else None
+        # None (default) -> reset() derives the bin center from THIS
+        # episode's own (possibly randomized) object position + offset,
+        # exactly as before this task ("coupled" mode -- see
+        # DEFAULT_BIN_TARGET_ZONE_OFFSET_XY). An explicit [x, y] here
+        # decouples the bin from wherever the object landed -- the bin
+        # sits at this FIXED world position every episode regardless of
+        # object_position (see this task's chat report, "새 독립
+        # randomization" / fixed_bin_object_xy mode). Only meaningful
+        # when use_bin=True; ignored otherwise.
+        self._bin_center_override_xy = list(bin_center_override_xy) if bin_center_override_xy is not None else None
+        # None (default) -> identity orientation (0 yaw), byte-identical
+        # to every existing caller's behavior before this task. An
+        # explicit radians value here is applied as a pure Z-axis
+        # rotation at object spawn (see reset()'s own object creation) --
+        # the grasp mechanism is a distance/gripper-state-triggered fixed
+        # constraint (see _maybe_trigger_grasp()) that never reads
+        # orientation, so this cannot by itself break grasp triggering.
+        self._object_yaw_rad = float(object_yaw_rad) if object_yaw_rad is not None else 0.0
         # Shallow-merged with defaults so a caller can override e.g. just
         # surface_height without repeating every other key.
         user_scene_config = scene_config or {}
@@ -516,9 +559,12 @@ class So101PyBulletBackend:
         surface_half_extents = _surface_half_extents(self.scene_config)
         object_half_extents = _object_half_extents(self.scene_config)
 
-        self.table_id = self._create_box(surface_half_extents, surface_position, color=[0.55, 0.35, 0.2, 1.0], mass=0.0)
+        self.table_id = self._create_box(surface_half_extents, surface_position, color=TABLE_COLOR_RGBA, mass=0.0)
         object_position = self._object_position_override if self._object_position_override is not None else _default_object_position(self.scene_config)
-        self.object_id = self._create_box(object_half_extents, object_position, color=[0.2, 0.6, 1.0, 1.0], mass=OBJECT_MASS)
+        object_orientation = p.getQuaternionFromEuler([0.0, 0.0, self._object_yaw_rad])
+        self.object_id = self._create_box(
+            object_half_extents, object_position, color=OBJECT_COLOR_RGBA, mass=OBJECT_MASS, orientation=object_orientation,
+        )
         self.step(OBJECT_SETTLE_STEPS)  # let any initial-contact wobble settle before recording "initial pose"
         self._object_initial_pose = self.get_object_pose()
 
@@ -529,7 +575,32 @@ class So101PyBulletBackend:
         # OBJECT_SETTLE_STEPS above), not its pre-settle spawn position.
         settled_object_position = self._object_initial_pose[0]
         offset_xy = self.scene_config["target_zone_offset_xy"]
-        self.target_zone_center_xy = [settled_object_position[0] + offset_xy[0], settled_object_position[1] + offset_xy[1]]
+        if self._bin_center_override_xy is not None:
+            # Fixed-bin mode (see this task's chat report,
+            # "fixed_bin_object_xy") -- the bin sits at this fixed world
+            # position regardless of where THIS episode's object landed.
+            # scene_config["target_zone_offset_xy"] is RE-DERIVED from
+            # the actual bin center and actual settled object position
+            # ONLY in this branch -- it no longer means "the bin follows
+            # the object by this fixed amount" once overridden, so
+            # get_scene_state()/callers deriving a transport delta from
+            # it (e.g. benchmark/collect_so101_bin_dataset.py) still see
+            # the correct effective offset for THIS episode (see this
+            # task's chat report, "object-bin 상대 offset이 사실상
+            # 상수" limitation this mode exists to fix). Left OUT of
+            # the coupled (else) branch below on purpose: recomputing it
+            # there via subtraction is a mathematical no-op but NOT a
+            # floating-point no-op (introduces ~1e-17 noise), which
+            # broke smoke_so101_bin_scene_layout.py's exact-value
+            # backward-compatibility checks the first time this was
+            # tried.
+            self.target_zone_center_xy = list(self._bin_center_override_xy)
+            self.scene_config["target_zone_offset_xy"] = [
+                self.target_zone_center_xy[0] - settled_object_position[0],
+                self.target_zone_center_xy[1] - settled_object_position[1],
+            ]
+        else:
+            self.target_zone_center_xy = [settled_object_position[0] + offset_xy[0], settled_object_position[1] + offset_xy[1]]
 
         # Open-top bin V1 -- built at the SAME center the flat marker
         # already uses (see this task's own "기존 target marker 중심
@@ -568,12 +639,18 @@ class So101PyBulletBackend:
 
         return self.get_observation()
 
-    def _create_box(self, half_extents: list, position: list, color: list, mass: float = 0.0) -> int:
+    def _create_box(self, half_extents: list, position: list, color: list, mass: float = 0.0, orientation: Optional[list] = None) -> int:
+        # None (default) -> identity quaternion via PyBullet's own
+        # createMultiBody default -- every existing call site (table,
+        # bin walls) omits this and is unaffected. Only the object's own
+        # call site (see reset()) ever passes a non-identity value (see
+        # this task's chat report, "object yaw randomization").
         collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents, physicsClientId=self.client_id)
         visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color, physicsClientId=self.client_id)
+        kwargs = {"baseOrientation": orientation} if orientation is not None else {}
         return p.createMultiBody(
             baseMass=mass, baseCollisionShapeIndex=collision_shape, baseVisualShapeIndex=visual_shape,
-            basePosition=position, physicsClientId=self.client_id,
+            basePosition=position, physicsClientId=self.client_id, **kwargs,
         )
 
     def _create_visual_marker(self, half_extents: list, position: list, color: list) -> int:
