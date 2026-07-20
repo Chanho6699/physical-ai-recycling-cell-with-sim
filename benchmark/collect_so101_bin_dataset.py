@@ -54,6 +54,14 @@ from pathlib import Path
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from benchmark.benchmark_so101_bin_diagnostic import (
+    FIXED_BIN_MODE_ANCHOR_OFFSET_XY,
+    FIXED_BIN_MODE_SURFACE_FOOTPRINT_XY,
+    FIXED_BIN_OBJECT_X_RANGE,
+    FIXED_BIN_OBJECT_Y_RANGE,
+    RANDOMIZATION_MODE_COUPLED_SMALL,
+    RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY,
+)
 from benchmark.collect_so101_episode import (
     make_frame_recorder,
     verify_dataset,
@@ -76,6 +84,7 @@ from benchmark.so101_scripted_expert import (
     run_pick_and_place_episode,
 )
 from robot_sim.so101_pybullet_backend import (
+    DEFAULT_SCENE_CONFIG,
     FRONT_CAMERA_HEIGHT,
     FRONT_CAMERA_WIDTH,
     InvalidSceneLayoutError,
@@ -97,7 +106,10 @@ def resolve(path_str: str) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def validate_episode_contract(recorded_frames: list, result: dict, scene_state: dict, seed: int) -> dict:
+def validate_episode_contract(
+    recorded_frames: list, result: dict, scene_state: dict, seed: int,
+    randomization_mode: str = RANDOMIZATION_MODE_COUPLED_SMALL, object_yaw_rad: float = 0.0,
+) -> dict:
     """Per-episode contract checks (this task's chat report, section 4).
     Operates on the IN-MEMORY frames recorded via wrapped_on_step for
     THIS episode only -- does not depend on LeRobotDataset's own
@@ -108,6 +120,8 @@ def validate_episode_contract(recorded_frames: list, result: dict, scene_state: 
     checks["place_success_true"] = result.get("place_success") is True
     checks["failure_reason_none"] = result.get("failure_reason") is None
     checks["use_bin_true"] = scene_state.get("use_bin") is True
+    checks["randomization_mode_matches"] = randomization_mode in (RANDOMIZATION_MODE_COUPLED_SMALL, RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY)
+    checks["object_yaw_is_zero"] = object_yaw_rad == 0.0
     checks["layout_validation_passed_true"] = scene_state.get("layout_validation_passed") is True
     debug = result.get("bin_success_debug") or {}
     checks["bin_success_debug_conditions_true"] = bool(debug) and all(
@@ -138,9 +152,21 @@ def validate_episode_contract(recorded_frames: list, result: dict, scene_state: 
     return checks
 
 
-def collect_episode(dataset, seed: int, task: str, episode_index_counter: dict) -> dict:
-    sampled_object_position = sample_object_position(seed, DEFAULT_X_RANGE, DEFAULT_Y_RANGE)
-    backend = So101PyBulletBackend(gui=False, use_bin=True, object_position=sampled_object_position)
+def collect_episode(
+    dataset, seed: int, task: str, episode_index_counter: dict,
+    randomization_mode: str = RANDOMIZATION_MODE_COUPLED_SMALL,
+    x_range: tuple = None, y_range: tuple = None, bin_center_override_xy: list = None, scene_config: dict = None,
+) -> dict:
+    x_range = x_range if x_range is not None else DEFAULT_X_RANGE
+    y_range = y_range if y_range is not None else DEFAULT_Y_RANGE
+    sampled_object_position = sample_object_position(seed, x_range, y_range)
+
+    backend_kwargs = {"gui": False, "use_bin": True, "object_position": sampled_object_position}
+    if bin_center_override_xy is not None:
+        backend_kwargs["bin_center_override_xy"] = bin_center_override_xy
+    if scene_config is not None:
+        backend_kwargs["scene_config"] = scene_config
+    backend = So101PyBulletBackend(**backend_kwargs)
 
     recorded_frames = []
     result = None
@@ -154,7 +180,7 @@ def collect_episode(dataset, seed: int, task: str, episode_index_counter: dict) 
             backend.reset()
         except InvalidSceneLayoutError as exc:
             return {
-                "seed": seed, "saved": False, "success": False,
+                "seed": seed, "saved": False, "success": False, "randomization_mode": randomization_mode,
                 "failure_reason": f"scene_invalid:{exc.failure_type}",
                 "frame_count": 0, "aborted": False, "contract": None,
                 "sampled_object_position": sampled_object_position,
@@ -185,16 +211,18 @@ def collect_episode(dataset, seed: int, task: str, episode_index_counter: dict) 
         if not place_success:
             dataset.clear_episode_buffer()
             return {
-                "seed": seed, "saved": False, "success": False, "failure_reason": failure_reason,
+                "seed": seed, "saved": False, "success": False, "randomization_mode": randomization_mode, "failure_reason": failure_reason,
                 "frame_count": len(recorded_frames), "aborted": False, "contract": None,
                 "sampled_object_position": sampled_object_position,
             }
 
-        contract = validate_episode_contract(recorded_frames, result, scene_state, seed)
+        contract = validate_episode_contract(
+            recorded_frames, result, scene_state, seed, randomization_mode=randomization_mode, object_yaw_rad=0.0,
+        )
         if not contract["pass"]:
             dataset.clear_episode_buffer()
             return {
-                "seed": seed, "saved": False, "success": True, "failure_reason": failure_reason,
+                "seed": seed, "saved": False, "success": True, "randomization_mode": randomization_mode, "failure_reason": failure_reason,
                 "frame_count": len(recorded_frames), "aborted": True, "contract": contract,
                 "sampled_object_position": sampled_object_position, "scene_state": scene_state, "result": result,
             }
@@ -205,7 +233,7 @@ def collect_episode(dataset, seed: int, task: str, episode_index_counter: dict) 
         episode_index_counter["count"] += 1
 
         return {
-            "seed": seed, "saved": True, "success": True, "failure_reason": None,
+            "seed": seed, "saved": True, "success": True, "randomization_mode": randomization_mode, "failure_reason": None,
             "frame_count": len(recorded_frames), "aborted": False, "contract": contract,
             "episode_index": episode_index, "sampled_object_position": sampled_object_position,
             "scene_state": scene_state, "result": result,
@@ -222,6 +250,13 @@ def main() -> None:
     parser.add_argument("--seed-start", type=int, default=DEFAULT_SEED_START)
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    parser.add_argument(
+        "--mode", type=str, default=RANDOMIZATION_MODE_COUPLED_SMALL,
+        choices=[RANDOMIZATION_MODE_COUPLED_SMALL, RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY],
+        help="coupled_small (default, unchanged): bin_center = object_position + offset. "
+             "fixed_bin_object_xy: bin stays fixed, only object XY is independently randomized "
+             "(see benchmark.benchmark_so101_bin_diagnostic's own --mode of the same name).",
+    )
     args = parser.parse_args()
 
     root = resolve(args.dataset_root)
@@ -241,18 +276,32 @@ def main() -> None:
     aborted = False
     abort_reason = None
 
+    collect_kwargs = {"randomization_mode": args.mode}
+    if args.mode == RANDOMIZATION_MODE_FIXED_BIN_OBJECT_XY:
+        nominal_object_xy = DEFAULT_SCENE_CONFIG["surface_center_xy"]
+        fixed_bin_center_xy = [
+            nominal_object_xy[0] + FIXED_BIN_MODE_ANCHOR_OFFSET_XY[0], nominal_object_xy[1] + FIXED_BIN_MODE_ANCHOR_OFFSET_XY[1],
+        ]
+        collect_kwargs.update({
+            "x_range": FIXED_BIN_OBJECT_X_RANGE, "y_range": FIXED_BIN_OBJECT_Y_RANGE,
+            "bin_center_override_xy": fixed_bin_center_xy,
+            "scene_config": {"surface_footprint_xy": FIXED_BIN_MODE_SURFACE_FOOTPRINT_XY},
+        })
+        print(f"--mode fixed_bin_object_xy: fixed_bin_center_xy={fixed_bin_center_xy}, "
+              f"x_range={FIXED_BIN_OBJECT_X_RANGE}, y_range={FIXED_BIN_OBJECT_Y_RANGE}")
+
     try:
         for seed in seeds:
-            outcome = collect_episode(dataset, seed, args.instruction, episode_index_counter)
+            outcome = collect_episode(dataset, seed, args.instruction, episode_index_counter, **collect_kwargs)
             per_seed_results.append(outcome)
 
             manifest_records.append({
                 "episode_index": outcome.get("episode_index"), "seed": seed, "robot_type": SO101_ROBOT_TYPE,
-                "skill": "pick_and_place", "scenario_group": "bin_pilot_20", "expert_policy": "scripted_so101",
+                "skill": "pick_and_place", "scenario_group": f"bin_pilot_{args.mode}", "expert_policy": "scripted_so101",
                 "success": outcome["success"], "frame_count": outcome["frame_count"],
                 "place_success": outcome["success"], "failure_reason": outcome["failure_reason"],
                 "dataset_action_space": "absolute_joint_position", "state_dimension": 6, "action_dimension": 6,
-                "saved": outcome["saved"], "use_bin": True,
+                "saved": outcome["saved"], "use_bin": True, "randomization_mode": args.mode, "object_yaw_rad": 0.0,
                 "bin_center": outcome.get("scene_state", {}).get("bin_center") if outcome.get("scene_state") else None,
                 "target_zone_offset_xy": outcome.get("scene_state", {}).get("target_zone_offset_xy") if outcome.get("scene_state") else None,
                 "layout_validation_passed": outcome.get("scene_state", {}).get("layout_validation_passed") if outcome.get("scene_state") else None,
@@ -303,7 +352,12 @@ def main() -> None:
         "seeds_requested": seeds,
         "seeds_saved": [r["seed"] for r in saved_results],
         "seeds_discarded": [r["seed"] for r in discarded_results],
-        "randomization_range": {"x_range": list(DEFAULT_X_RANGE), "y_range": list(DEFAULT_Y_RANGE)},
+        "randomization_mode": args.mode,
+        "randomization_range": {
+            "x_range": list(collect_kwargs.get("x_range", DEFAULT_X_RANGE)),
+            "y_range": list(collect_kwargs.get("y_range", DEFAULT_Y_RANGE)),
+        },
+        "fixed_bin_center_xy": collect_kwargs.get("bin_center_override_xy"),
         "action_representation": "absolute_joint_position_6d",
         "action_dimension": 6,
         "joint_names": list(SO101_JOINT_NAMES),
