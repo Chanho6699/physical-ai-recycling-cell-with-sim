@@ -92,3 +92,6 @@ results/safety_hand_debug/
 # Device/session-specific VLA backend configs (e.g. Tailscale IP) --
 # never committed, see docs/split_deployment_tailscale_success.md
 configs/*local*.json
+.venv-client/
+__pycache__/
+*.pyc
