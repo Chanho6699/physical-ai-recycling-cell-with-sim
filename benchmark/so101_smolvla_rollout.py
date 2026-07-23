@@ -101,7 +101,10 @@ def derive_policy_noise_seed(base_policy_seed: int, environment_seed: int, repea
     return base_policy_seed + environment_seed * POLICY_NOISE_SEED_BLOCK_SIZE + repeat_id
 
 
-def build_rollout_backend(seed: int, object_position_override: list = None, object_footprint_xy_override: list = None) -> So101PyBulletBackend:
+def build_rollout_backend(
+    seed: int, object_position_override: list = None, object_footprint_xy_override: list = None,
+    object_shape_override: str = None, object_radius_override: float = None,
+) -> So101PyBulletBackend:
     """`object_position_override` (see this task's chat report, "XY 외삽
     평가") -- when given, used VERBATIM as the object's spawn position
     instead of sample_object_position(seed, ...). `seed` is then only a
@@ -131,6 +134,15 @@ def build_rollout_backend(seed: int, object_position_override: list = None, obje
     scene_config_override = {"surface_footprint_xy": FIXED_BIN_MODE_SURFACE_FOOTPRINT_XY}
     if object_footprint_xy_override is not None:
         scene_config_override["object_footprint_xy"] = object_footprint_xy_override
+    # object_shape_override/object_radius_override (see this task's chat
+    # report, "Stage 1B cylinder zero-shot 평가") -- additive, same
+    # pattern as object_footprint_xy_override above. None (default, every
+    # existing cube/box call site) leaves scene_config's own "box"
+    # default untouched.
+    if object_shape_override is not None:
+        scene_config_override["object_shape"] = object_shape_override
+    if object_radius_override is not None:
+        scene_config_override["object_radius"] = object_radius_override
     return So101PyBulletBackend(
         gui=False, use_bin=True, object_position=sampled_object_position,
         bin_center_override_xy=fixed_bin_center_xy, scene_config=scene_config_override,
@@ -257,6 +269,7 @@ def run_one_rollout(
     policy, preprocessor, postprocessor, seed: int, max_steps: int = MAX_ROLLOUT_STEPS,
     debug_queue_log: bool = False, diagnostic_log: bool = False, policy_noise_seed: int = None,
     object_position_override: list = None, object_footprint_xy_override: list = None,
+    object_shape_override: str = None, object_radius_override: float = None,
 ) -> dict:
     """`diagnostic_log=True` (see this task's chat report, "pre-grasp
     실패 원인을 정확히 구분하기 위한 진단 rollout") ONLY appends
@@ -285,6 +298,7 @@ def run_one_rollout(
 
     backend = build_rollout_backend(
         seed, object_position_override=object_position_override, object_footprint_xy_override=object_footprint_xy_override,
+        object_shape_override=object_shape_override, object_radius_override=object_radius_override,
     )
     limits = None
     step_log = []

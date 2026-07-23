@@ -1,0 +1,60 @@
+{
+  "description": "Cylinder size candidates screened for Stage 1C feasibility (see this task's chat report, 'Cylinder/Can 후보 크기 선정' and docs/experiments/so101_stage1c_cylinder_feasibility_summary.md). Screened via V1's own unmodified run_pick_and_place_episode() with a cylinder collision/visual shape substituted through the additive object_shape='cylinder' scene_config override -- no backend behavior change for the existing box/cube default.",
+  "screening_method": "Each candidate spawned at 5 position groups (center, interior, edge, corner, x_min_corridor; 1 seed each) via V1's unmodified pipeline. Legacy grasp-trigger success was 100% for EVERY candidate tested (0.03m through 0.10m diameter) because the grasp mechanism is a fixed-distance + gripper-angle constraint, not contact-force based (contact_count measured 0 for all candidates, including the already-validated 0.04m cube/box baseline) -- so raw grasp-trigger success could NOT discriminate candidate feasibility on its own; selection was instead anchored to the one magnitude already validated extensively in this project (Stage 1A/1B: 0.04m closing-axis width).",
+  "gripper_geometry_notes": {
+    "gripper_joint_type": "revolute (rotating single moving jaw against gripper_link body), NOT a linear parallel-jaw slide -- see third_party/so101_arm/so101_new_calib.urdf's own <joint name=\"gripper\" type=\"revolute\">",
+    "gripper_joint_limits_rad": [-0.174533, 1.74533],
+    "contact_based_grasp_verification": "not meaningful in this simulation as currently modeled -- contact_count between robot and object measured 0 at the grasp moment across all tested cylinder radii (0.015m-0.05m) AND the pre-existing cube/box baseline; grasp success is judged purely by EE-to-object-center distance (GRASP_DISTANCE_THRESHOLD_M=0.04m) and gripper closed-angle threshold (GRASP_GRIPPER_CLOSED_THRESHOLD=0.15 normalized), both shape/size agnostic",
+    "no_documented_numeric_max_opening_spec": "third_party/so101_arm/README.md and SOURCE.md do not state a numeric max-opening/diameter spec for this gripper design"
+  },
+  "candidates": [
+    {
+      "name": "small",
+      "radius_m": 0.015,
+      "diameter_m": 0.03,
+      "height_m": 0.04,
+      "aspect_ratio_diameter_to_height": 0.75,
+      "mass_kg": 0.05,
+      "friction": "unset (PyBullet default 0.5, matches existing cube/box)",
+      "gripper_clearance_note": "smaller than the validated 0.04m cube/box width; screened successfully at all 5 position groups",
+      "scene_validity": "valid at all 5 position groups tested (center/interior/edge/corner/x_min_corridor)",
+      "bin_compatibility": "valid",
+      "selected": false
+    },
+    {
+      "name": "medium_can",
+      "radius_m": 0.02,
+      "diameter_m": 0.04,
+      "height_m": 0.04,
+      "aspect_ratio_diameter_to_height": 1.0,
+      "mass_kg": 0.05,
+      "friction": "unset (PyBullet default 0.5, matches existing cube/box)",
+      "gripper_clearance_note": "identical footprint scale to the already-validated cube (object_footprint_xy=[0.02,0.02]) and rectangular box closing-axis width (BOX_FOOTPRINT_XY[0]*2=0.04m) -- isolates shape as the only new variable, matching this project's own Stage 1B methodology",
+      "scene_validity": "valid at all 5 position groups tested (center/interior/edge/corner/x_min_corridor)",
+      "bin_compatibility": "valid",
+      "selected": true,
+      "selection_rationale": "Reuses the one magnitude already validated across thousands of Stage 1A/1B episodes, minimizing confound risk. Clearly distinguishable from cube/box by SHAPE alone (rotationally symmetric collision geometry), no size difference needed for distinctiveness. Expert-only evaluation (benchmark/evaluate_so101_expert_v2_cylinder.py) confirmed 125/125 = 100% legacy_success AND physical_success across all 5 position groups and 5 scene-yaw values (0/45/90/135/180 degrees, rotational-symmetry check)."
+    },
+    {
+      "name": "near_limit",
+      "radius_m": 0.028,
+      "diameter_m": 0.056,
+      "height_m": 0.04,
+      "aspect_ratio_diameter_to_height": 1.4,
+      "mass_kg": 0.05,
+      "friction": "unset (PyBullet default 0.5, matches existing cube/box)",
+      "gripper_clearance_note": "40% larger diameter than the validated cube/box scale; also screened successfully (legacy criterion) at all 5 position groups, but introduces a second simultaneously-varying factor (size, on top of shape) that was not pursued further this task to keep the feasibility study clean (single-variable-at-a-time, matching Stage 1B's own stated discipline)",
+      "scene_validity": "valid at all 5 position groups tested (center/interior/edge/corner/x_min_corridor)",
+      "bin_compatibility": "valid",
+      "selected": false
+    }
+  ],
+  "excluded_by_task_scope": [
+    "on-its-side or tilted cylinder (upright only, per this task's own absolute scope)",
+    "arbitrary roll/pitch",
+    "dented/deformed can geometry",
+    "bottle-with-neck geometry",
+    "mass/friction randomization",
+    "real beverage-can literal dimensions (task explicitly deprioritizes exact real-world replication in favor of sim-stable grasp size)"
+  ]
+}

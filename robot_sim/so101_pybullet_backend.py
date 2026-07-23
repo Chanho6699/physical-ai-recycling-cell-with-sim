@@ -91,8 +91,16 @@ DEFAULT_SCENE_CONFIG = {
     # descent, not a large lateral move -- deliberate for the object-
     # approach/grasp smoke tests, not a workspace-coverage claim.
     "surface_center_xy": [0.391, 0.0],
-    "object_height": 0.04,         # full object box height (2x half-extent)
-    "object_footprint_xy": [0.02, 0.02],     # half-extents in x/y
+    "object_height": 0.04,         # full object height (2x half-extent, box or cylinder)
+    "object_footprint_xy": [0.02, 0.02],     # half-extents in x/y -- BOX shape only, ignored when object_shape="cylinder"
+    # Additive, opt-in shape selector (see this task's chat report,
+    # "Expert V2.1 cylinder 지원") -- default "box" reproduces EVERY
+    # existing scene byte-for-byte (reset()'s object-creation branch
+    # below only takes the cylinder path when this is explicitly
+    # overridden to "cylinder"; no existing caller does that). "radius"
+    # below is read ONLY on that opt-in path.
+    "object_shape": "box",
+    "object_radius": 0.02,        # half-extent-equivalent for object_shape="cylinder"; unused for "box"
     "safety_margin": 0.01,          # clearance added above surface_height for the EE minimum-height floor
     # Place target zone (see this task's chat report, "목표 표면 또는
     # target zone 추가") -- a PURELY VISUAL marker (no collision shape),
@@ -562,9 +570,20 @@ class So101PyBulletBackend:
         self.table_id = self._create_box(surface_half_extents, surface_position, color=TABLE_COLOR_RGBA, mass=0.0)
         object_position = self._object_position_override if self._object_position_override is not None else _default_object_position(self.scene_config)
         object_orientation = p.getQuaternionFromEuler([0.0, 0.0, self._object_yaw_rad])
-        self.object_id = self._create_box(
-            object_half_extents, object_position, color=OBJECT_COLOR_RGBA, mass=OBJECT_MASS, orientation=object_orientation,
-        )
+        # object_shape branch (see this task's chat report, "Expert V2.1
+        # cylinder 지원") -- "box" (the default, and every scene_config
+        # used before this task) takes the EXACT SAME _create_box() call
+        # as before, byte-for-byte. Only an explicit "cylinder" override
+        # takes the new path.
+        if self.scene_config.get("object_shape", "box") == "cylinder":
+            self.object_id = self._create_cylinder(
+                self.scene_config["object_radius"], self.scene_config["object_height"] / 2.0,
+                object_position, color=OBJECT_COLOR_RGBA, mass=OBJECT_MASS, orientation=object_orientation,
+            )
+        else:
+            self.object_id = self._create_box(
+                object_half_extents, object_position, color=OBJECT_COLOR_RGBA, mass=OBJECT_MASS, orientation=object_orientation,
+            )
         self.step(OBJECT_SETTLE_STEPS)  # let any initial-contact wobble settle before recording "initial pose"
         self._object_initial_pose = self.get_object_pose()
 
@@ -647,6 +666,24 @@ class So101PyBulletBackend:
         # this task's chat report, "object yaw randomization").
         collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents, physicsClientId=self.client_id)
         visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color, physicsClientId=self.client_id)
+        kwargs = {"baseOrientation": orientation} if orientation is not None else {}
+        return p.createMultiBody(
+            baseMass=mass, baseCollisionShapeIndex=collision_shape, baseVisualShapeIndex=visual_shape,
+            basePosition=position, physicsClientId=self.client_id, **kwargs,
+        )
+
+    def _create_cylinder(self, radius: float, half_height: float, position: list, color: list, mass: float = 0.0, orientation: Optional[list] = None) -> int:
+        """Additive counterpart to _create_box() (see this task's chat
+        report, "Expert V2.1 cylinder 지원") -- same structure (collision
+        + visual, createMultiBody), GEOM_CYLINDER instead of GEOM_BOX.
+        PyBullet's cylinder is upright (local Z) by construction, matching
+        this task's own "upright cylinder만 사용" scope -- object_yaw_rad
+        still applies via `orientation` exactly as it does for the box
+        path, though it has no visible effect on an upright, rotationally-
+        symmetric cylinder (used only for the yaw-invariance check this
+        task's own Expert evaluation performs)."""
+        collision_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=radius, height=2.0 * half_height, physicsClientId=self.client_id)
+        visual_shape = p.createVisualShape(p.GEOM_CYLINDER, radius=radius, length=2.0 * half_height, rgbaColor=color, physicsClientId=self.client_id)
         kwargs = {"baseOrientation": orientation} if orientation is not None else {}
         return p.createMultiBody(
             baseMass=mass, baseCollisionShapeIndex=collision_shape, baseVisualShapeIndex=visual_shape,
